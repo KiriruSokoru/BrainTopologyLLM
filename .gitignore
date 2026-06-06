@@ -17,7 +17,7 @@ data/
 *.ubyte
 
 # Результаты (графики оставим для README)
-results/
+# results/
 !results/README.md
 
 # IDE

@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+*.egg-info/
+
+# Виртуальное окружение
+venv/
+venv_brain/
+.venv/
+
+# Данные
+data/
+*.pth
+*.npz
+*.gz
+*.ubyte
+
+# Результаты (графики оставим для README)
+results/
+!results/README.md
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Системное
+.DS_Store
+Thumbs.db

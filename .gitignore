@@ -31,3 +31,16 @@ data/
 # Системное
 .DS_Store
 Thumbs.db
+
+# Checkpoints and experiment states
+checkpoints/
+*.pt
+*.pth
+
+# Logs
+*.log
+nohup.out
+
+# Python cache
+__pycache__/
+*.pyc

@@ -1,0 +1,26 @@
+# Чекпоинты экспериментов (могут быть большими)
+checkpoints/
+experiments/results/
+
+# Данные CIFAR-10
+data/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+venv/
+venv_brain/
+.env
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Логи и временные файлы
+*.log
+*.tmp
+.DS_Store

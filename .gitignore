@@ -1,46 +1,38 @@
-# Python
-__pycache__/
-*.py[cod]
-*.so
-*.egg-info/
-
-# Виртуальное окружение
-venv/
-venv_brain/
-.venv/
+# Чекпоинты (большие файлы)
+checkpoints/
+experiments/broken_resnet/checkpoints/
+experiments/broken_resnet/data/
+experiments/broken_resnet/__pycache__/
 
 # Данные
 data/
+
+# Модели (большие .pth файлы)
 *.pth
 *.npz
-*.gz
-*.ubyte
 
-# Результаты (графики оставим для README)
-# results/
-!results/README.md
+# Python
+__pycache__/
+*.pyc
+venv/
+venv_brain/
+.env
 
 # IDE
 .vscode/
 .idea/
 *.swp
 
-# Jupyter
-.ipynb_checkpoints/
+# Результаты (кроме самих JSON, но они уже в results/)
+# results/ - оставляем, там нужные JSON
 
-# Системное
-.DS_Store
-Thumbs.db
-
-# Checkpoints and experiment states
-checkpoints/
-*.pt
+# Старые артефакты MNIST/ResNet
+*.npz
 *.pth
-
-# Logs
-*.log
-nohup.out
-
-# Python cache
-__pycache__/
-*.pyc
+pruning_comparison.npz
+ricci_results_linux.npz
+simple_cnn_mnist.pth
+results/perelman_surgery.npz
+results/resnet_pruning.npz
+results/resnet_archetype_surgery.pt
+README.md.bak

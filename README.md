@@ -97,11 +97,11 @@ brain_topology_llm/
 ├── README.md
 └── .gitignore
 
-## Быстрый старт
+Быстрый старт
 
 Создание окружения и установка зависимостей:
 
-```bash
+bash
 python3.10 -m venv venv_brain
 source venv_brain/bin/activate
 pip install torch torchvision networkx GraphRicciCurvature numpy matplotlib scikit-learn tqdm psutil

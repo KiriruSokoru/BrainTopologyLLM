@@ -1,4 +1,3 @@
-```markdown
 # BrainTopologyLLM
 
 **Топологическая оптимизация нейросетей через кривизну Риччи и хирургию Перельмана**
@@ -84,17 +83,17 @@
 
 brain_topology_llm/
 ├── src/
-│   ├── mnist_ricci_pipeline.py # Базовый пайплайн
-│   ├── compare_pruning.py # Сравнение методов
-│   ├── perelman_surgery.py # Хирургия Перельмана для MNIST
-│   ├── resnet_archetype_surgery.py # Хирургия для ResNet
-│   ├── checkpoint_manager.py # Умное сохранение
-│   ├── train_cifar_resnet.py # Обучение ResNet
-│   ├── landscape.py # Визуализация
-│   └── load_controller.py # Контроль нагрузки CPU
-├── results/ # Графики и данные
-├── checkpoints/ # Сохранённые состояния
-├── data/ # Датасеты
+│   ├── mnist_ricci_pipeline.py
+│   ├── compare_pruning.py
+│   ├── perelman_surgery.py
+│   ├── resnet_archetype_surgery.py
+│   ├── checkpoint_manager.py
+│   ├── train_cifar_resnet.py
+│   ├── landscape.py
+│   └── load_controller.py
+├── results/
+├── checkpoints/
+├── data/
 ├── README.md
 └── .gitignore
 
@@ -106,38 +105,37 @@ brain_topology_llm/
 python3.10 -m venv venv_brain
 source venv_brain/bin/activate
 pip install torch torchvision networkx GraphRicciCurvature numpy matplotlib scikit-learn tqdm psutil
-```
 
 Запуск MNIST эксперимента:
+bash
 
-```bash
 python src/perelman_surgery.py
-```
 
 Запуск ResNet эксперимента:
+bash
 
-```bash
 python src/resnet_archetype_surgery.py
-```
 
 Принудительный перезапуск (с удалением чекпоинтов):
+bash
 
-```bash
 python src/resnet_archetype_surgery.py --force_restart
-```
 
-## Что дальше
+Что дальше
 
-- MNIST + хирургия Перельмана (завершено)
-- CIFAR-10 + ResNet (завершено: сингулярностей нет)
-- GPT-2 + хирургия внутренних слоёв (в процессе)
-- Сжатие промптов через топологию токенов
-- Multi-seed validation и статистическая значимость
+    MNIST + хирургия Перельмана (завершено)
 
-## Философия проекта
+    CIFAR-10 + ResNet (завершено: сингулярностей нет)
+
+    GPT-2 + хирургия внутренних слоёв (в процессе)
+
+    Сжатие промптов через топологию токенов
+
+    Multi-seed validation и статистическая значимость
+
+Философия проекта
 
 Перельман показал, что любую сложную форму можно упростить, заменяя проблемные участки на стандартные. Та же логика работает с нейросетями: вместо того чтобы удалять "шумные" нейроны (что похоже на русскую рулетку), мы заменяем их на усреднённые, стабильные версии.
-
-## Лицензия
+Лицензия
 
 MIT

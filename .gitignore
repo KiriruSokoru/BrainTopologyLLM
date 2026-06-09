@@ -36,3 +36,8 @@ results/perelman_surgery.npz
 results/resnet_pruning.npz
 results/resnet_archetype_surgery.pt
 README.md.bak
+logs/
+config/
+*.pyc
+__pycache__/
+checkpoints/*.pt

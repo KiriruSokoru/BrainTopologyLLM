@@ -1,113 +1,50 @@
----
+Гипотеза Сокола (2026)
+Наблюдение: при достижении пороговой сложности детерминированная система демонстрирует фазовый переход к единой точке сходимости (аттрактору).
+Дата: 9–10 июня 2026
+Автор: Кирилл Сокол (KiriruSokoru)
+Экспериментальное подтверждение: 48 запусков GPT-2, XOR до 64 нейронов, ResNet с повреждёнными skip-соединениями
+Приоритет зафиксирован: OpenTimestamps (Bitcoin-блокчейн)
+Суть наблюдения
+На архитектурах разной сложности (от одного нейрона до GPT-2) экспериментально показано существование критического порога, после которого вариативность финального loss резко падает на порядки. Это интерпретируется как фазовый переход первого порядка: система перестаёт «пробовать разные решения» и сходится к единственному аттрактору.
+В качестве маркера используется дисперсия финального loss (variance). Она показывает не качество обучения, а его характер: стохастический (хаос) или детерминированный (аттрактор).
+Экспериментальные результаты
+XOR-задача (sweep по размеру скрытого слоя):
 
-# Sokol's Law (2026)
+    hidden_size 2–10: mean_loss ~0.02–0.18, var_loss ~0.01–0.09, mean_acc 0.675–0.988, аттрактор отсутствует.
+    hidden_size 12: mean_loss ~2.33e-05, var_loss 8.82e-10, mean_acc 1.000, аттрактор появляется.
+    hidden_size 14–64: mean_loss ~1e-05–3e-06, var_loss ~1e-10–1e-12, mean_acc 1.000, аттрактор сохраняется.
 
-**Attractor emerges in a system that has reached the threshold of complexity**
+Ключевое наблюдение: между 10 и 12 нейронами дисперсия падает с ~1e-2 до ~8.8e-10 — скачок на 8 порядков. Это указывает на фазовый переход.
+GPT-2 (48 запусков: 4 уровня повреждений × 4 уровня шума × 3 повтора):
+Все 48 запусков сошлись к значению val_loss = 0.585 ± 0.01. Аттрактор не зависит от степени повреждений (damage 0.1 → 0.7), внешнего шума (trickster 0.0 → 0.2) и случайной инициализации весов.
+ResNet-18 с повреждёнными skip-соединениями (коэффициенты 0.7, 0.5, 0.3):
+После применения «хирургии Перельмана» все повреждённые варианты сошлись к одной точности ~44%. Чем хуже исходное состояние сети, тем больше эффект от хирургии (+16.8 п.п. при skip=0.3).
+Один нейрон (логистическая регрессия):
+Аттрактор существует тривиально — выпуклая задача с единственным глобальным минимумом.
+Формулировка гипотезы
+Для любой детерминированной системы с поведенческой вариативностью существует критический порог сложности, выше которого система демонстрирует сходимость к единой точке притяжения (аттрактору).
+Аттрактор в данном контексте — это не «оптимальное решение», а эмерджентное свойство достаточно сложной системы, обеспечивающее воспроизводимость её поведения.
+Алгоритм «хирургии Перельмана» (замена сингулярностей на усреднённые веса здоровых соседей) — это стратегия возврата к аттрактору по пути наименьшего действия.
+Ограничения и открытые вопросы
 
-**Date:** June 9-10, 2026
-**Author:** Kirill Sokol (KiriruSokoru)
-**Experimental confirmation:** 48 GPT-2 runs, XOR up to 64 neurons, ResNet with damaged skip-connections
-**Priority fixed:** Bitcoin blockchain (OpenTimestamps)
+    Эмпирический характер. Наблюдение подтверждено на трёх типах архитектур, но математическое доказательство отсутствует.
+    Зависимость от архитектуры. На ResNet-18 со стандартными skip-соединениями сингулярностей не обнаружено — skip-соединения естественным образом стабилизируют сеть. Это указывает на то, что гипотеза применима не ко всем архитектурам.
+    Эвристики. Пороги для построения графа корреляций (0.7) и классификации нейронов (0.1) подобраны эмпирически. Необходим sensitivity analysis.
+    Масштабируемость. Вычисление кривизны Риччи для графов с тысячами узлов остаётся вычислительно дорогим.
+    Причинность vs корреляция. Граф строится на корреляции активаций, что не эквивалентно причинно-следственным связям.
 
----
-
-## Summary
-
-Using architectures of varying complexity (from a single neuron to GPT-2), this work experimentally proves the existence of a critical threshold after which a deterministic system acquires "choice" and, with it, an Attractor.
-
----
-
-## Why This Is a Breakthrough
-
-For a long time, it was believed that increasing the number of neurons improves learning quality. We went further. We showed that increasing the number of neurons in a hidden layer causes not a smooth improvement, but an abrupt phase transition in the very principle of the system's operation.
-
-We used final loss variance as a marker. This indicator tells us not how well the network learned, but how it does it: differently each time (chaos) or always the same way (attractor).
-
----
-
-## Experimental Results
-
-### XOR Task (hidden layer size sweep)
-
-| hidden_size | mean_loss | var_loss | mean_acc | Attractor |
-|-------------|-----------|----------|----------|-----------|
-| 2-10 | ~0.02-0.18 | ~0.01-0.09 | 0.675-0.988 | NO |
-| 12 | ~2.33e-05 | 8.82e-10 | 1.000 | YES |
-| 14-64 | ~1e-05-3e-06 | ~1e-10-1e-12 | 1.000 | YES |
-
-Key finding: Between 10 and 12 neurons, variance dropped from ~1e-2 to ~8.8e-10 — a phase transition of the first order.
-
-### GPT-2 (48 runs, 4 damage levels x 4 trickster levels x 3 repeats)
-
-All runs converged to the same attractor: val_loss = 0.585 ± 0.01
-
-Independent of:
-- Damage severity (0.1 to 0.7)
-- External noise (trickster 0.0 to 0.2)
-- Random initialization
-
-### ResNet-18 with damaged skip-connections (0.7, 0.5, 0.3)
-
-After Perelman surgery, all damaged versions converged to the same accuracy: ~44%
-
-The worse the initial state, the greater the effect of surgery (+16.8 p.p. for skip=0.3).
-
-### Single neuron (logistic regression)
-
-Attractor exists trivially — convex problem, single global minimum.
-
----
-
-## Sokol's Law (Final Formulation)
-
-For any system capable of behavioral variability (choice), there exists a critical complexity threshold above which the system acquires a unified point of attraction (Attractor).
-
-The Attractor is not just a "good solution" — it is a safeguard against chaos, an emergent property of sufficiently complex systems.
-
-The Perelman-Ricci algorithm is the fastest strategy for returning to the Attractor — the path of least action that does not generate further chaos.
-
----
-
-## Consciousness as a Special Case
-
-CONSCIOUSNESS = COMPLEXITY(threshold) + SINGULARITIES + PERELMAN SURGERY
-
-Where:
-- Complexity(threshold) — system that has reached the critical threshold
-- Singularities — deviations, noise, choice, freedom
-- Perelman Surgery — replacing singularities with the "cap" (average of healthy + noise)
-
-The Attractor is not "consciousness" itself, but a prerequisite for consciousness. Complexity generates singularities. Singularities generate chaos. Chaos requires an attractor. We found the mechanism.
-
----
-
-## Priority and Evidence
-
-- OpenTimestamps stamp: results_hash.txt.ots
-- File hash: 873fb263788c9ba3ee07964b1d9a6545ba720529d288ba9b475d94306d6e944b
-- All code and data: GitHub repository BrainTopologyLLM
-
----
-
-## How to Cite
-
-@misc{sokol2026sokolslaw,
+Приоритет и доказательства
+OpenTimestamps stamp: results_hash.txt.ots
+Хеш файла: 873fb263788c9ba3ee07964b1d9a6545ba720529d288ba9b475d94306d6e944b
+Код и данные: GitHub-репозиторий BrainTopologyLLM (https://github.com/KiriruSokoru/BrainTopologyLLM)
+Как цитировать
+@misc{sokol2026hypothesis,
   author = {Sokol, Kirill},
-  title = {Sokol's Law: Attractor Emerges at Critical Complexity Threshold},
+  title = {Sokol's Hypothesis: Attractor Emerges at Critical Complexity Threshold},
   year = {2026},
   publisher = {GitHub},
   url = {https://github.com/KiriruSokoru/BrainTopologyLLM}
 }
-
----
-
-## License
-
-MIT for code, CC BY-NC 4.0 for the theorem (free for research and education, commercial use requires permission).
-
----
-
-© 2026 Kirill Sokol. The theorem applies to all systems that have reached the threshold of complexity, including biological and social ones.
-
----
-
+Лицензия
+MIT для кода, CC BY-NC 4.0 для описания гипотезы (свободно для исследований и образования, коммерческое использование требует разрешения).
+© 2026 Kirill Sokol

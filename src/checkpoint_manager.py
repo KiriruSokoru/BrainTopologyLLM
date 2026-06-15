@@ -9,7 +9,7 @@ import json
 import logging
 import os
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, cast
 
 import torch
 
@@ -107,6 +107,8 @@ class CheckpointManager:
         )
         
         checkpoint = torch.load(filepath, map_location='cpu', weights_only=False)
+        # Explicitly cast to expected dict type for static checkers
+        checkpoint = cast(Dict[str, Any], checkpoint)
         self.metadata = checkpoint['metadata']
         self.metadata['resumed'] = True
         self.metadata['resume_time'] = datetime.now().isoformat()

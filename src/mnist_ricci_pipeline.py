@@ -125,16 +125,22 @@ def prune_model(
     with torch.no_grad():
         for idx in prune_indices:
             label = neuron_labels[idx]
-            layer, neuron = label.split(':')
-            neuron = int(neuron)
+            layer, neuron_str = label.split(':')
+            neuron = int(neuron_str)
             
             if layer == 'conv1':
+                assert pruned.conv1.weight is not None
+                assert pruned.conv1.bias is not None
                 pruned.conv1.weight[neuron] = 0.0
                 pruned.conv1.bias[neuron] = 0.0
             elif layer == 'conv2':
+                assert pruned.conv2.weight is not None
+                assert pruned.conv2.bias is not None
                 pruned.conv2.weight[neuron] = 0.0
                 pruned.conv2.bias[neuron] = 0.0
             elif layer == 'fc1':
+                assert pruned.fc1.weight is not None
+                assert pruned.fc1.bias is not None
                 pruned.fc1.weight[neuron] = 0.0
                 pruned.fc1.bias[neuron] = 0.0
     

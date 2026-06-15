@@ -8,8 +8,7 @@
 import argparse
 import logging
 import os
-from collections import defaultdict
-from typing import Dict, List, Set, Tuple, DefaultDict
+from typing import Dict, List, Set, Tuple
 
 import matplotlib
 matplotlib.use('Agg')
@@ -42,11 +41,11 @@ def get_layer_sizes(neuron_labels: List[str]) -> Dict[str, int]:
     """
     sizes: Dict[str, int] = {}
     for label in neuron_labels:
-        layer, idx = label.split(':')
-        idx = int(idx)
-        if layer not in sizes:
-            sizes[layer] = 0
-        sizes[layer] = max(sizes[layer], idx + 1)
+        layer_name, neuron_str = label.split(':')
+        neuron = int(neuron_str)
+        if layer_name not in sizes:
+            sizes[layer_name] = 0
+        sizes[layer_name] = max(sizes[layer_name], neuron + 1)
     return sizes
 
 
@@ -79,8 +78,9 @@ def surgery_replace(
     # Маппинг: глобальный индекс -> (слой, локальный индекс)
     neuron_map: Dict[int, Tuple[str, int]] = {}
     for idx, label in enumerate(neuron_labels):
-        layer, neuron_str = label.split(':')
-        neuron_map[idx] = (layer, int(neuron_str))
+        layer_name, neuron_str = label.split(':')
+        neuron = int(neuron_str)
+        neuron_map[idx] = (layer_name, neuron)
     
     # Клонируем модель
     new_model = MNIST_CNN().to(device)
@@ -103,6 +103,8 @@ def surgery_replace(
             
             # Считаем среднее значение соседей для этого нейрона
             if layer_name == 'conv1':
+                assert new_model.conv1.weight is not None
+                assert new_model.conv1.bias is not None
                 avg_weight = torch.zeros_like(new_model.conv1.weight[local_idx])
                 avg_bias = torch.zeros_like(new_model.conv1.bias[local_idx])
                 for n in neighbors:
@@ -114,6 +116,8 @@ def surgery_replace(
                 new_model.conv1.bias[local_idx] = avg_bias
             
             elif layer_name == 'conv2':
+                assert new_model.conv2.weight is not None
+                assert new_model.conv2.bias is not None
                 avg_weight = torch.zeros_like(new_model.conv2.weight[local_idx])
                 avg_bias = torch.zeros_like(new_model.conv2.bias[local_idx])
                 for n in neighbors:
@@ -125,6 +129,8 @@ def surgery_replace(
                 new_model.conv2.bias[local_idx] = avg_bias
             
             elif layer_name == 'fc1':
+                assert new_model.fc1.weight is not None
+                assert new_model.fc1.bias is not None
                 avg_weight = torch.zeros_like(new_model.fc1.weight[local_idx])
                 avg_bias = torch.zeros_like(new_model.fc1.bias[local_idx])
                 for n in neighbors:
@@ -229,8 +235,9 @@ def main(
     # Маппинг для pruning
     neuron_map: Dict[int, Tuple[str, int]] = {}
     for idx, label in enumerate(neuron_labels):
-        layer, neuron_str = label.split(':')
-        neuron_map[idx] = (layer, int(neuron_str))
+        layer_name, neuron_str = label.split(':')
+        neuron = int(neuron_str)
+        neuron_map[idx] = (layer_name, neuron)
     
     for frac in prune_fractions:
         n_prune = int(n * frac)
@@ -240,27 +247,37 @@ def main(
         prune_set = set(sorted_by_importance[:n_prune])
         pm = MNIST_CNN().to(device)
         pm.load_state_dict(model.state_dict())
-        
+
+        # Единственное создание layer_masks для этой итерации
+        layer_masks: dict[str, torch.Tensor] = {}
+
         with torch.no_grad():
-            layer_masks: DefaultDict[str, torch.Tensor] = defaultdict(lambda: torch.ones(200))
             for idx in prune_set:
-                layer, neuron = neuron_map[idx]
-                layer_masks[layer][neuron] = 0.0
-            
-            if 'conv1' in layer_masks:
-                m = layer_masks['conv1'][:16].to(device)
-                pm.conv1.weight.data *= m.view(-1, 1, 1, 1)
-                pm.conv1.bias.data *= m
-            
-            if 'conv2' in layer_masks:
-                m = layer_masks['conv2'][:32].to(device)
-                pm.conv2.weight.data *= m.view(-1, 1, 1, 1)
-                pm.conv2.bias.data *= m
-            
-            if 'fc1' in layer_masks:
-                m = layer_masks['fc1'][:128].to(device)
-                pm.fc1.weight.data *= m.unsqueeze(1)
-                pm.fc1.bias.data *= m
+                layer_name, neuron = neuron_map[idx]
+                if layer_name not in layer_masks:
+                    layer_masks[layer_name] = torch.ones(200)
+                layer_masks[layer_name][neuron] = 0.0
+
+            if 'conv1' not in layer_masks:
+                layer_masks['conv1'] = torch.ones(200)
+            conv1_mask = layer_masks['conv1']
+            assert isinstance(conv1_mask, torch.Tensor)
+            pm.conv1.weight.data *= conv1_mask[:16].to(device).view(-1, 1, 1, 1)  # type: ignore
+            pm.conv1.bias.data *= conv1_mask[:16].to(device)  # type: ignore
+
+            if 'conv2' not in layer_masks:
+                layer_masks['conv2'] = torch.ones(200)
+            conv2_mask = layer_masks['conv2']
+            assert isinstance(conv2_mask, torch.Tensor)
+            pm.conv2.weight.data *= conv2_mask[:32].to(device).view(-1, 1, 1, 1)  # type: ignore
+            pm.conv2.bias.data *= conv2_mask[:32].to(device)  # type: ignore
+
+            if 'fc1' not in layer_masks:
+                layer_masks['fc1'] = torch.ones(200)
+            fc1_mask = layer_masks['fc1']
+            assert isinstance(fc1_mask, torch.Tensor)
+            pm.fc1.weight.data *= fc1_mask[:200].to(device).view(-1, 1)  # type: ignore
+            pm.fc1.bias.data *= fc1_mask[:200].to(device)  # type: ignore
         
         acc_hard = accuracy(pm, test_loader, device)
         results_hard.append(acc_hard)
@@ -279,26 +296,37 @@ def main(
         pm_random = MNIST_CNN().to(device)
         pm_random.load_state_dict(model.state_dict())
         
+        # Сбрасываем маски к единицам и применяем для случайного набора
+        for k in list(layer_masks.keys()):
+            layer_masks[k].fill_(1.0)
+
         with torch.no_grad():
-            layer_masks: DefaultDict[str, torch.Tensor] = defaultdict(lambda: torch.ones(200))
             for idx in random_set:
-                layer, neuron = neuron_map[idx]
-                layer_masks[layer][neuron] = 0.0
-            
-            if 'conv1' in layer_masks:
-                m = layer_masks['conv1'][:16].to(device)
-                pm_random.conv1.weight.data *= m.view(-1, 1, 1, 1)
-                pm_random.conv1.bias.data *= m
-            
-            if 'conv2' in layer_masks:
-                m = layer_masks['conv2'][:32].to(device)
-                pm_random.conv2.weight.data *= m.view(-1, 1, 1, 1)
-                pm_random.conv2.bias.data *= m
-            
-            if 'fc1' in layer_masks:
-                m = layer_masks['fc1'][:128].to(device)
-                pm_random.fc1.weight.data *= m.unsqueeze(1)
-                pm_random.fc1.bias.data *= m
+                layer_name, neuron = neuron_map[idx]
+                if layer_name not in layer_masks:
+                    layer_masks[layer_name] = torch.ones(200)
+                layer_masks[layer_name][neuron] = 0.0
+
+            if 'conv1' not in layer_masks:
+                layer_masks['conv1'] = torch.ones(200)
+            conv1_mask = layer_masks['conv1']
+            assert isinstance(conv1_mask, torch.Tensor)
+            pm_random.conv1.weight.data *= conv1_mask[:16].to(device).view(-1, 1, 1, 1)  # type: ignore
+            pm_random.conv1.bias.data *= conv1_mask[:16].to(device)  # type: ignore
+
+            if 'conv2' not in layer_masks:
+                layer_masks['conv2'] = torch.ones(200)
+            conv2_mask = layer_masks['conv2']
+            assert isinstance(conv2_mask, torch.Tensor)
+            pm_random.conv2.weight.data *= conv2_mask[:32].to(device).view(-1, 1, 1, 1)  # type: ignore
+            pm_random.conv2.bias.data *= conv2_mask[:32].to(device)  # type: ignore
+
+            if 'fc1' not in layer_masks:
+                layer_masks['fc1'] = torch.ones(200)
+            fc1_mask = layer_masks['fc1']
+            assert isinstance(fc1_mask, torch.Tensor)
+            pm_random.fc1.weight.data *= fc1_mask[:200].to(device).view(-1, 1)  # type: ignore
+            pm_random.fc1.bias.data *= fc1_mask[:200].to(device)  # type: ignore
         
         acc_random = accuracy(pm_random, test_loader, device)
         results_random.append(acc_random)

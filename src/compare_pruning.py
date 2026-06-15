@@ -84,14 +84,14 @@ def prune_model(
             layer_name, local_idx = neuron_map[idx]
             
             if layer_name == 'conv1':
-                pruned.conv1.weight[local_idx] = 0.0
-                pruned.conv1.bias[local_idx] = 0.0
+                pruned.conv1.weight[local_idx] = 0.0,  # type: ignore
+                pruned.conv1.bias[local_idx] = 0.0,  # type: ignore
             elif layer_name == 'conv2':
-                pruned.conv2.weight[local_idx] = 0.0
-                pruned.conv2.bias[local_idx] = 0.0
+                pruned.conv2.weight[local_idx] = 0.0  # type: ignore
+                pruned.conv2.bias[local_idx] = 0.0  # type: ignore
             elif layer_name == 'fc1':
-                pruned.fc1.weight[local_idx] = 0.0
-                pruned.fc1.bias[local_idx] = 0.0
+                pruned.fc1.weight[local_idx] = 0.0  # type: ignore
+                pruned.fc1.bias[local_idx] = 0.0  # type: ignore
                 
     return pruned
 
@@ -222,18 +222,26 @@ def main(
 
     # 7. Сохранение данных
     npz_path = os.path.join(output_dir, 'pruning_comparison.npz')
-    # Собираем словарь аргументов для безопасной передачи в np.savez
-    save_kwargs: Dict[str, object] = {
-        'baseline': baseline,
-        'fractions': fractions,
-        'methods': methods,
-        'ricci': ricci,
-        'neuron_labels': neuron_labels,
-    }
-    for m in methods:
-        save_kwargs[f"results_{m}"] = results[m]
+    # Явно формируем поля для сохранения (без использования **dict)
+    results_ricci = results.get('Ricci', [])
+    results_weight = results.get('Weight', [])
+    results_random = results.get('Random', [])
 
-    np.savez(npz_path, **save_kwargs)
+    importance_ricci = importance_scores.get('Ricci', np.array([]))
+    importance_weight = importance_scores.get('Weight', np.array([]))
+
+    np.savez(
+        npz_path,
+        baseline=baseline,
+        fractions=fractions,
+        results_ricci=results_ricci,
+        results_weight=results_weight,
+        results_random=results_random,
+        importance_ricci=importance_ricci,
+        importance_weight=importance_weight,
+        ricci_values=ricci,
+        neuron_labels=neuron_labels,
+    )
     logger.info(f"Данные сохранены: {npz_path}")
     logger.info("=" * 60)
     logger.info("ЭКСПЕРИМЕНТ ЗАВЕРШЁН УСПЕШНО")

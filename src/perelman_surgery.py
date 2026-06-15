@@ -9,7 +9,7 @@ import argparse
 import logging
 import os
 from collections import defaultdict
-from typing import Dict, List, Set, Tuple
+from typing import Dict, List, Set, Tuple, DefaultDict
 
 import matplotlib
 matplotlib.use('Agg')
@@ -79,8 +79,8 @@ def surgery_replace(
     # Маппинг: глобальный индекс -> (слой, локальный индекс)
     neuron_map: Dict[int, Tuple[str, int]] = {}
     for idx, label in enumerate(neuron_labels):
-        layer, neuron = label.split(':')
-        neuron_map[idx] = (layer, int(neuron))
+        layer, neuron_str = label.split(':')
+        neuron_map[idx] = (layer, int(neuron_str))
     
     # Клонируем модель
     new_model = MNIST_CNN().to(device)
@@ -229,8 +229,8 @@ def main(
     # Маппинг для pruning
     neuron_map: Dict[int, Tuple[str, int]] = {}
     for idx, label in enumerate(neuron_labels):
-        layer, neuron = label.split(':')
-        neuron_map[idx] = (layer, int(neuron))
+        layer, neuron_str = label.split(':')
+        neuron_map[idx] = (layer, int(neuron_str))
     
     for frac in prune_fractions:
         n_prune = int(n * frac)
@@ -242,7 +242,7 @@ def main(
         pm.load_state_dict(model.state_dict())
         
         with torch.no_grad():
-            layer_masks = defaultdict(lambda: torch.ones(200))
+            layer_masks: DefaultDict[str, torch.Tensor] = defaultdict(lambda: torch.ones(200))
             for idx in prune_set:
                 layer, neuron = neuron_map[idx]
                 layer_masks[layer][neuron] = 0.0
@@ -280,7 +280,7 @@ def main(
         pm_random.load_state_dict(model.state_dict())
         
         with torch.no_grad():
-            layer_masks = defaultdict(lambda: torch.ones(200))
+            layer_masks: DefaultDict[str, torch.Tensor] = defaultdict(lambda: torch.ones(200))
             for idx in random_set:
                 layer, neuron = neuron_map[idx]
                 layer_masks[layer][neuron] = 0.0

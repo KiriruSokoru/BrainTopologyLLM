@@ -222,15 +222,18 @@ def main(
 
     # 7. Сохранение данных
     npz_path = os.path.join(output_dir, 'pruning_comparison.npz')
-    np.savez(
-        npz_path,
-        baseline=baseline,
-        fractions=fractions,
-        methods=methods,
-        **{f"results_{m}": results[m] for m in methods},
-        ricci=ricci,
-        neuron_labels=neuron_labels
-    )
+    # Собираем словарь аргументов для безопасной передачи в np.savez
+    save_kwargs: Dict[str, object] = {
+        'baseline': baseline,
+        'fractions': fractions,
+        'methods': methods,
+        'ricci': ricci,
+        'neuron_labels': neuron_labels,
+    }
+    for m in methods:
+        save_kwargs[f"results_{m}"] = results[m]
+
+    np.savez(npz_path, **save_kwargs)
     logger.info(f"Данные сохранены: {npz_path}")
     logger.info("=" * 60)
     logger.info("ЭКСПЕРИМЕНТ ЗАВЕРШЁН УСПЕШНО")

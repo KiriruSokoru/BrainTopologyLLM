@@ -6,6 +6,7 @@ __all__ = [
     "accuracy",
     "evaluate",
     "train_model",
+    "train_epoch",
 ]
 
 def accuracy(model: torch.nn.Module, loader: DataLoader, device: torch.device) -> float:
@@ -105,3 +106,41 @@ def train_model(
         final_acc = correct / total if total > 0 else 0.0
         
     return final_acc
+
+
+def train_epoch(
+    model: torch.nn.Module,
+    loader: DataLoader,
+    optimizer: torch.optim.Optimizer,
+    criterion: torch.nn.Module,
+    device: torch.device,
+) -> float:
+    """Train model for a single epoch and return average loss as float.
+
+    Args:
+        model: PyTorch model.
+        loader: DataLoader providing training batches.
+        optimizer: Optimizer instance.
+        criterion: Loss function.
+        device: Computation device.
+
+    Returns:
+        Average loss over the epoch as float.
+    """
+    model.train()
+    model.to(device)
+    running_loss = 0.0
+    total = 0
+    for inputs, targets in loader:
+        inputs, targets = inputs.to(device), targets.to(device)
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, targets)
+        loss.backward()
+        optimizer.step()
+
+        running_loss += loss.item() * inputs.size(0)
+        total += inputs.size(0)
+
+    avg_loss = running_loss / total if total > 0 else 0.0
+    return float(avg_loss)

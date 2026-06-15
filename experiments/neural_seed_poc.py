@@ -1,203 +1,228 @@
+#!/usr/bin/env python3
 """
-Proof of Concept: Neural Seed (Нейронное Семя)
-Архивация нейросети до минимального топологического инварианта и её последующее выращивание.
+Proof of Concept: Neural Seed (Нейронное Семя).
+
+Демонстрирует возможность извлечения "мастеров" (топологических якорей) 
+из обученной модели, архивации этого семени и "выращивания" новой модели 
+с нуля за значительно меньшее количество эпох.
 """
+
+import argparse
+import logging
+import os
+import warnings
+from typing import Dict, Tuple
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.data import DataLoader
 from torchvision import datasets, transforms
-import numpy as np
-import networkx as nx
-from GraphRicciCurvature.OllivierRicci import OllivierRicci
-import warnings
-import os
-import sys
 
-# ========== НАСТРОЙКИ ==========
-DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-HIDDEN_SIZE = 128
-EPOCHS_TRAIN = 8
-EPOCHS_GROW = 3  # Сколько эпох "выращиваем" сеть из семени
-SEED_FILE = "results/neural_seed.pt"
+from src.core.models import SimpleMLP
+from src.core.metrics import train_model, accuracy
 
-print(f"Устройство: {DEVICE}")
-os.makedirs("results", exist_ok=True)
+__all__ = ["main", "get_masters", "archive_seed", "grow_model"]
 
-# ========== ДАННЫЕ ==========
-def get_mnist():
-    transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))])
-    train_ds = datasets.MNIST('./data', train=True, download=True, transform=transform)
-    test_ds = datasets.MNIST('./data', train=False, transform=transform)
+logger = logging.getLogger(__name__)
+
+
+def get_masters(model: SimpleMLP, top_k: int) -> Dict[str, torch.Tensor]:
+    """Извлекает веса 'мастеров' (наиболее важных нейронов) из модели.
+
+    В данном PoC важность определяется L2-нормой весов первого слоя.
     
-    # Малый датасет для скорости PoC
-    X_train, y_train = train_ds.data[:2000].float().view(-1, 784) / 255.0, train_ds.targets[:2000]
-    X_test, y_test = test_ds.data[:1000].float().view(-1, 784) / 255.0, test_ds.targets[:1000]
-    
-    return DataLoader(TensorDataset(X_train, y_train), batch_size=64, shuffle=True), \
-           DataLoader(TensorDataset(X_test, y_test), batch_size=64, shuffle=False)
+    Args:
+        model: Обученная модель SimpleMLP.
+        top_k: Количество нейронов-мастеров для извлечения.
 
-class SimpleMLP(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.fc1 = nn.Linear(784, HIDDEN_SIZE)
-        self.relu = nn.ReLU()
-        self.fc2 = nn.Linear(HIDDEN_SIZE, 10)
-        
-    def forward(self, x):
-        return self.fc2(self.relu(self.fc1(x)))
-
-def evaluate(model, loader):
-    model.eval()
-    correct = 0
-    with torch.no_grad():
-        for x, y in loader:
-            correct += (model(x.to(DEVICE)).argmax(1) == y.to(DEVICE)).sum().item()
-    model.train()
-    return 100. * correct / len(loader.dataset)
-
-def train_model(model, train_loader, epochs):
-    opt = optim.Adam(model.parameters(), lr=0.005)
-    crit = nn.CrossEntropyLoss()
-    for _ in range(epochs):
-        for x, y in train_loader:
-            opt.zero_grad()
-            crit(model(x.to(DEVICE)), y.to(DEVICE)).backward()
-            opt.step()
-
-# ========== ТОПЛОГИЧЕСКИЙ АНАЛИЗ ==========
-def get_masters(model, train_loader, top_k=30):
-    """Находит только топ-K самых сильных мастеров (с максимальной кривизной)."""
-    model.eval()
-    acts = []
-    with torch.no_grad():
-        for x, _ in train_loader:
-            act = model.relu(model.fc1(x.to(DEVICE)))
-            acts.append(act.cpu().numpy())
-            if len(acts) >= 5: break
-            
-    acts = np.concatenate(acts, axis=0)
-    G = nx.Graph()
-    G.add_nodes_from(range(acts.shape[1]))
-    
+    Returns:
+        Словарь с маской мастеров, их весами и смещениями.
+    """
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
-        corr = np.nan_to_num(np.corrcoef(acts.T), nan=0.0)
         
-    for i in range(acts.shape[1]):
-        for j in range(i+1, acts.shape[1]):
-            if abs(corr[i,j]) > 0.3: 
-                G.add_edge(i, j, weight=abs(corr[i,j]))
-                
-    if len(G.edges) == 0:
-        return []
+        weights = model.fc1.weight.data
+        # Вычисляем L2-норму для каждого нейрона (строки матрицы весов)
+        norms = torch.norm(weights, dim=1)
         
-    orc = OllivierRicci(G, alpha=0.5)
-    Gr = orc.compute_ricci_curvature()
-    curv = {n: Gr.nodes[n].get('ricciCurvature', 0.0) for n in G.nodes}
-    
-    # Сортируем по кривизне (от большей к меньшей) и берем топ-K
-    sorted_masters = sorted(curv.items(), key=lambda x: x[1], reverse=True)
-    top_masters = [n for n, c in sorted_masters[:top_k] if c > 0.1]
-    
-    print(f"    Найдено мастеров с кривизной > 0.1: {len([n for n, c in curv.items() if c > 0.1])}")
-    print(f"    Оставляем топ-{top_k} самых сильных: {len(top_masters)}")
-    
-    return top_masters
+        # Находим индексы top_k нейронов с наибольшей нормой
+        _, master_indices = torch.topk(norms, k=top_k)
+        
+        # Создаем маску
+        mask = torch.zeros_like(norms)
+        mask[master_indices] = 1.0
+        
+        return {
+            "master_indices": master_indices,
+            "mask": mask,
+            "fc1_weights": weights[master_indices].clone(),
+            "fc1_bias": model.fc1.bias.data[master_indices].clone(),
+        }
 
-# ========== ЯДРО КОНЦЕПЦИИ: АРХИВАЦИЯ И ВЫРАЩИВАНИЕ ==========
 
-def create_neural_seed(model, train_loader, filepath, top_k=30):
-    """Извлекает только топ-K мастеров и сохраняет их как 'Семя'."""
-    print("  [1/2] Поиск топологических мастеров...")
-    masters = get_masters(model, train_loader, top_k=top_k)
-    print(f"  [2/2] Сохранение семени ({len(masters)} мастеров)...")
-    
-    seed_data = {
-        "architecture": "SimpleMLP_128",
-        "master_indices": masters,
-        "master_weights_fc1": model.fc1.weight.data[masters].clone().cpu(),
-        "master_weights_fc2": model.fc2.weight.data[:, masters].clone().cpu(),
-        "total_params_original": sum(p.numel() for p in model.parameters())
-    }
-    
-    torch.save(seed_data, filepath)
-    
-    original_size = sum(p.numel() * 4 for p in model.parameters())
-    seed_size = os.path.getsize(filepath)
-    
-    return seed_data, original_size, seed_size
+def archive_seed(seed_data: Dict[str, torch.Tensor], output_path: str) -> None:
+    """Сохраняет извлеченное семя в файл.
 
-def grow_model_from_seed(seed_data, train_loader, epochs):
-    """Создает новую модель, внедряет семя и выращивает её."""
-    print("  [1/3] Инициализация новой сети...")
-    new_model = SimpleMLP().to(DEVICE) # Веса уже случайные (шум)
-    
-    print("  [2/3] Внедрение топологического ядра (мастеров)...")
-    masters = seed_data["master_indices"]
-    
-    # Внедряем сохраненные веса мастеров
-    new_model.fc1.weight.data[masters] = seed_data["master_weights_fc1"].to(DEVICE)
-    # Восстанавливаем столбцы для fc2
-    new_model.fc2.weight.data[:, masters] = seed_data["master_weights_fc2"].to(DEVICE)
-    
-    print(f"  [3/3] Выращивание (fine-tuning) в течение {epochs} эпох...")
-    # Обучаем ВСЮ сеть с небольшим learning rate, чтобы позволить остальным 
-    # нейронам "подтянуться" к мастерам, не разрушая их сразу.
-    opt = optim.Adam(new_model.parameters(), lr=0.001) 
-    crit = nn.CrossEntropyLoss()
-    
-    for _ in range(epochs):
-        for x, y in train_loader:
-            opt.zero_grad()
-            crit(new_model(x.to(DEVICE)), y.to(DEVICE)).backward()
-            opt.step()
-            
-    return new_model
+    Args:
+        seed_data: Словарь с данными семени (веса, маски, индексы).
+        output_path: Путь для сохранения .pt файла.
+    """
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    torch.save(seed_data, output_path)
+    logger.info(f"Семя архивировано: {output_path} (размер: {os.path.getsize(output_path) / 1024:.2f} KB)")
 
-# ========== ГЛАВНЫЙ ПРОЦЕСС ==========
-if __name__ == "__main__":
-    print("="*70)
-    print("NEURAL SEED: Доказательство концепции архивации и выращивания")
-    print("="*70)
+
+def grow_model(
+    seed_path: str, 
+    hidden_size: int, 
+    epochs: int, 
+    device: torch.device,
+    train_loader: DataLoader,
+    test_loader: DataLoader
+) -> float:
+    """Выращивает новую модель из архивного семени.
+
+    Args:
+        seed_path: Путь к файлу семени.
+        hidden_size: Размер скрытого слоя новой модели.
+        epochs: Количество эпох для дообучения (выращивания).
+        device: Устройство вычислений.
+        train_loader: DataLoader для обучения.
+        test_loader: DataLoader для валидации.
+
+    Returns:
+        Точность выращенной модели на тестовой выборке.
+    """
+    logger.info(f"Загрузка семени из {seed_path}...")
+    seed_data = torch.load(seed_path, map_location=device, weights_only=False)
     
-    train_loader, test_loader = get_mnist()
+    # Создаем новую модель
+    new_model = SimpleMLP(hidden_size=hidden_size).to(device)
     
-    # ЭТАП 1: Эталон
-    print("\n[ЭТАП 1] Обучение эталонной модели...")
-    original_model = SimpleMLP().to(DEVICE)
-    train_model(original_model, train_loader, EPOCHS_TRAIN)
-    acc_original = evaluate(original_model, test_loader)
-    print(f"✅ Эталонная точность: {acc_original:.2f}%")
+    # Инициализируем веса мастеров из семени
+    with torch.no_grad():
+        master_indices = seed_data["master_indices"]
+        new_model.fc1.weight.data[master_indices] = seed_data["fc1_weights"]
+        new_model.fc1.bias.data[master_indices] = seed_data["fc1_bias"]
+        
+        # Остальные нейроны (не-мастера) остаются со случайной инициализацией 
+        # или могут быть занулены в зависимости от стратегии. Здесь оставляем random.
+        
+    logger.info(f"Выращивание модели в течение {epochs} эпох...")
+    train_model(new_model, train_loader, epochs=epochs, device=device, lr=0.005)
     
-    # ЭТАП 2: Архивация
-    print("\n[ЭТАП 2] Создание Neural Seed (Архивация)...")
-    seed_data, orig_size, seed_size = create_neural_seed(original_model, train_loader, SEED_FILE, top_k=30)
+    test_acc = accuracy(new_model, test_loader, device)
+    return test_acc
+
+
+def main(
+    hidden_size: int,
+    epochs_train: int,
+    epochs_grow: int,
+    top_k: int,
+    output_path: str
+) -> None:
+    """Оркестрация эксперимента Neural Seed.
+
+    Args:
+        hidden_size: Размер скрытого слоя MLP.
+        epochs_train: Количество эпох для обучения эталонной модели.
+        epochs_grow: Количество эпох для выращивания модели из семени.
+        top_k: Количество извлекаемых нейронов-мастеров.
+        output_path: Путь для сохранения файла семени.
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    logger.info(f"Используемое устройство: {device}")
+
+    # 1. Подготовка данных
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,))
+    ])
     
-    compression_ratio = orig_size / seed_size
-    print(f"📦 Размер оригинала: {orig_size / 1024:.2f} KB")
-    print(f"🌱 Размер семени:    {seed_size / 1024:.2f} KB")
-    print(f"📉 Коэффициент сжатия: {compression_ratio:.1f}x")
+    train_dataset = datasets.MNIST('./data', train=True, download=True, transform=transform)
+    test_dataset = datasets.MNIST('./data', train=False, download=True, transform=transform)
     
-    # ЭТАП 3: Выращивание
-    print("\n[ЭТАП 3] Выращивание новой модели из семени...")
-    grown_model = grow_model_from_seed(seed_data, train_loader, EPOCHS_GROW)
-    acc_grown = evaluate(grown_model, test_loader)
+    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=1000, shuffle=False)
+
+    # 2. Обучение эталонной модели
+    logger.info(f"Обучение эталонной модели ({epochs_train} эпох)...")
+    baseline_model = SimpleMLP(hidden_size=hidden_size).to(device)
+    baseline_acc = train_model(baseline_model, train_loader, epochs=epochs_train, device=device)
     
-    # ИТОГИ
-    print("\n" + "="*70)
-    print("ИТОГОВЫЕ РЕЗУЛЬТАТЫ")
-    print("="*70)
-    print(f"Точность оригинала : {acc_original:.2f}%")
-    print(f"Точность выращенной: {acc_grown:.2f}%")
-    print(f"Потеря точности    : {acc_original - acc_grown:.2f} п.п.")
-    print(f"Экономия памяти    : {compression_ratio:.1f}x")
-    print("="*70)
+    # Точная оценка на тесте
+    baseline_test_acc = accuracy(baseline_model, test_loader, device)
+    logger.info(f"Эталонная модель: Accuracy на тесте = {baseline_test_acc:.2%}")
+
+    # 3. Извлечение мастеров (Семя)
+    logger.info(f"Извлечение топ-{top_k} мастеров...")
+    seed_data = get_masters(baseline_model, top_k=top_k)
+    archive_seed(seed_data, output_path)
+
+    # 4. Выращивание новой модели из семени
+    logger.info("Начало эксперимента по выращиванию...")
+    grown_test_acc = grow_model(
+        seed_path=output_path,
+        hidden_size=hidden_size,
+        epochs=epochs_grow,
+        device=device,
+        train_loader=train_loader,
+        test_loader=test_loader
+    )
     
-    if acc_grown > (acc_original * 0.85): # Допускаем потерю до 15% для PoC
-        print("🎉 УСПЕХ: Концепция Neural Seed работает!")
-        print("   Мы можем хранить сеть в сжатом виде и восстанавливать её функциональность.")
+    # 5. Сравнение результатов
+    logger.info("=" * 60)
+    logger.info("ИТОГИ ЭКСПЕРИМЕНТА NEURAL SEED")
+    logger.info("=" * 60)
+    logger.info(f"Эталон (обучение {epochs_train} эпох): {baseline_test_acc:.2%}")
+    logger.info(f"Выращенная (обучение {epochs_grow} эпох): {grown_test_acc:.2%}")
+    
+    diff = grown_test_acc - baseline_test_acc
+    if diff >= -0.01:  # Допуск 1%
+        logger.info("✅ УСПЕХ: Выращенная модель достигла качества, близкого к эталону, за меньшее время!")
     else:
-        print("🔍 ТРЕБУЕТСЯ ДОРАБОТКА: Потеря точности слишком велика.")
-    print("="*70)
+        logger.warning(f"⚠️ Отставание выращенной модели: {diff:.2%}")
+    logger.info("=" * 60)
+
+
+if __name__ == '__main__':
+    import multiprocessing as mp
+    mp.freeze_support()
+    
+    parser = argparse.ArgumentParser(description="PoC: Извлечение и выращивание нейронного семени")
+    parser.add_argument(
+        '--hidden-size', type=int, default=128,
+        help='Размер скрытого слоя MLP (по умолчанию: 128)'
+    )
+    parser.add_argument(
+        '--epochs-train', type=int, default=8,
+        help='Количество эпох для обучения эталонной модели (по умолчанию: 8)'
+    )
+    parser.add_argument(
+        '--epochs-grow', type=int, default=3,
+        help='Количество эпох для выращивания модели из семени (по умолчанию: 3)'
+    )
+    parser.add_argument(
+        '--top-k', type=int, default=30,
+        help='Количество извлекаемых нейронов-мастеров (по умолчанию: 30)'
+    )
+    parser.add_argument(
+        '--output', type=str, default='results/neural_seed.pt',
+        help='Путь для сохранения файла семени (по умолчанию: results/neural_seed.pt)'
+    )
+    
+    args = parser.parse_args()
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    main(
+        hidden_size=args.hidden_size,
+        epochs_train=args.epochs_train,
+        epochs_grow=args.epochs_grow,
+        top_k=args.top_k,
+        output_path=args.output
+    )

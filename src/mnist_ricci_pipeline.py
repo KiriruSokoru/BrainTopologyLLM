@@ -1,73 +1,64 @@
 #!/usr/bin/env python3
 """
-MNIST Ricci Flow — Linux native (fork works here)
+MNIST Ricci Pipeline — полный пайплайн анализа топологии нейросети.
+
+1. Загружает или обучает модель
+2. Собирает активации
+3. Строит граф корреляций
+4. Вычисляет кривизну Риччи
+5. Применяет pruning
+6. Визуализирует результаты
 """
-import multiprocessing as mp
-import torch
-import torch.nn as nn
-from torchvision import datasets, transforms
-from torch.utils.data import DataLoader
-import numpy as np
-import networkx as nx
-from GraphRicciCurvature.OllivierRicci import OllivierRicci
+
+import argparse
+import logging
+import os
+from typing import List
+
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from collections import defaultdict
-import os, warnings
-warnings.filterwarnings('ignore')
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
 
-# Ограничиваем потоки
+from src.core.models import MNIST_CNN
+from src.core.metrics import accuracy
+from src.core.activations import collect_activations
+from src.core.graph_builder import build_activation_graph
+from src.core.ricci import compute_ricci_curvature
+
+logger = logging.getLogger(__name__)
+
 torch.set_num_threads(4)
-os.environ['OMP_NUM_THREADS'] = '4'
 
-class MNIST_CNN(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.conv1 = nn.Conv2d(1, 16, 3, padding=1)
-        self.conv2 = nn.Conv2d(16, 32, 3, padding=1)
-        self.fc1 = nn.Linear(32*7*7, 128)
-        self.fc2 = nn.Linear(128, 10)
-        self.relu = nn.ReLU()
-        self.pool = nn.MaxPool2d(2,2)
-        self.activations = {}
-        self._hooks()
+
+def load_or_train_model(
+    checkpoint_path: str,
+    epochs: int,
+    device: torch.device
+) -> MNIST_CNN:
+    """Загружает модель из чекпоинта или обучает с нуля.
     
-    def _hooks(self):
-        def hook(name):
-            def fn(m, i, o): self.activations[name] = o.detach()
-            return fn
-        self.conv1.register_forward_hook(hook('conv1'))
-        self.conv2.register_forward_hook(hook('conv2'))
-        self.fc1.register_forward_hook(hook('fc1'))
-        self.fc2.register_forward_hook(hook('fc2'))
+    Args:
+        checkpoint_path: Путь к файлу чекпоинта.
+        epochs: Количество эпох для обучения.
+        device: Устройство вычислений.
     
-    def forward(self, x):
-        x = self.pool(self.relu(self.conv1(x)))
-        x = self.pool(self.relu(self.conv2(x)))
-        x = x.view(x.size(0), -1)
-        x = self.relu(self.fc1(x))
-        x = self.fc2(x)
-        return x
-
-def accuracy(m, loader):
-    m.eval()
-    correct = 0
-    with torch.no_grad():
-        for data, target in loader:
-            data, target = data.to(device), target.to(device)
-            output = m(data)
-            pred = output.argmax(dim=1, keepdim=True)
-            correct += pred.eq(target.view_as(pred)).sum().item()
-    return 100. * correct / len(loader.dataset)
-
-def main():
-    global device
-    device = torch.device('cpu')
-    print("=" * 50)
-    print("MNIST Ricci Flow — Linux Native")
-    print(f"Device: CPU, Threads: {torch.get_num_threads()}")
-    print("=" * 50)
+    Returns:
+        Обученная модель.
+    """
+    model = MNIST_CNN().to(device)
+    
+    if os.path.exists(checkpoint_path):
+        logger.info(f"Загрузка модели из {checkpoint_path}")
+        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+        return model
+    
+    logger.info(f"Чекпоинт не найден. Обучение модели на {epochs} эпох...")
     
     # Данные
     transform = transforms.Compose([
@@ -75,184 +66,259 @@ def main():
         transforms.Normalize((0.1307,), (0.3081,))
     ])
     
-    test_dataset = datasets.MNIST('./data', train=False, download=True, transform=transform)
-    test_loader = DataLoader(test_dataset, batch_size=1000, shuffle=False)
     train_dataset = datasets.MNIST('./data', train=True, download=True, transform=transform)
     train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
     
-    # Модель
-    model = MNIST_CNN().to(device)
-    if os.path.exists('simple_cnn_mnist.pth'):
-        model.load_state_dict(torch.load('simple_cnn_mnist.pth', map_location=device))
-        print("Model loaded from file")
-    else:
-        print("Training model (2 min)...")
-        import torch.optim as optim
-        opt = optim.Adam(model.parameters(), lr=0.001)
-        crit = nn.CrossEntropyLoss()
-        for epoch in range(3):
-            model.train()
-            for data, target in train_loader:
-                data, target = data.to(device), target.to(device)
-                opt.zero_grad()
-                loss = crit(model(data), target)
-                loss.backward()
-                opt.step()
-            print(f"  Epoch {epoch+1}/3 done")
-        torch.save(model.state_dict(), 'simple_cnn_mnist.pth')
-        print("  Saved: simple_cnn_mnist.pth")
+    # Обучение
+    criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
     
-    model.eval()
-    baseline = accuracy(model, test_loader)
-    print(f"Baseline accuracy: {baseline:.2f}%")
+    for epoch in range(epochs):
+        model.train()
+        running_loss = 0.0
+        correct = 0
+        total = 0
+        
+        for inputs, targets in train_loader:
+            inputs, targets = inputs.to(device), targets.to(device)
+            optimizer.zero_grad()
+            outputs = model(inputs)
+            loss = criterion(outputs, targets)
+            loss.backward()
+            optimizer.step()
+            
+            running_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += targets.size(0)
+            correct += predicted.eq(targets).sum().item()
+        
+        train_acc = 100.0 * correct / total
+        logger.info(f"Epoch {epoch+1}/{epochs} - Loss: {running_loss/len(train_loader):.4f} - Acc: {train_acc:.2f}%")
     
-    # Активации (50 батчей)
-    print("\nCollecting activations (50 batches)...")
-    all_acts = defaultdict(list)
+    # Сохраняем чекпоинт
+    torch.save(model.state_dict(), checkpoint_path)
+    logger.info(f"Модель сохранена в {checkpoint_path}")
+    
+    return model
+
+
+def prune_model(
+    model: MNIST_CNN,
+    prune_indices: set,
+    neuron_labels: List[str],
+    device: torch.device
+) -> MNIST_CNN:
+    """Применяет маску pruning к модели.
+    
+    Args:
+        model: Исходная модель.
+        prune_indices: Индексы нейронов для удаления.
+        neuron_labels: Список меток нейронов.
+        device: Устройство вычислений.
+    
+    Returns:
+        Новая модель с применённым pruning.
+    """
+    pruned = MNIST_CNN().to(device)
+    pruned.load_state_dict(model.state_dict())
+    
     with torch.no_grad():
-        for idx, (data, _) in enumerate(train_loader):
-            if idx >= 50: break
-            data = data.to(device)
-            _ = model(data)
-            for name, act in model.activations.items():
-                if len(act.shape) == 4:
-                    act = act.mean(dim=[2,3])
-                all_acts[name].append(act.cpu().numpy())
-    
-    for name in all_acts:
-        all_acts[name] = np.concatenate(all_acts[name], axis=0)
-    
-    # Граф
-    print("Building graph...")
-    neuron_data = []
-    neuron_labels = []
-    for layer_name, acts in all_acts.items():
-        for i in range(acts.shape[1]):
-            neuron_data.append(acts[:, i])
-            neuron_labels.append(f"{layer_name}:{i}")
-    
-    neuron_data = np.array(neuron_data)
-    corr = np.corrcoef(neuron_data)
-    n = corr.shape[0]
-    
-    G = nx.Graph()
-    G.add_nodes_from(range(n))
-    for i in range(n):
-        for j in range(i+1, n):
-            if abs(corr[i,j]) >= 0.7:
-                G.add_edge(i, j, weight=1.0 - abs(corr[i,j]))
-    
-    print(f"Graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
-    
-    # Ricci (использует fork — на Linux работает)
-    print("\nComputing Ollivier-Ricci curvature...")
-    print("(This takes ~1-2 min, using all cores)")
-    
-    orc = OllivierRicci(G, alpha=0.5, weight="weight", verbose="INFO")
-    G_ricci = orc.compute_ricci_curvature()
-    
-    node_ricci = {}
-    for node in G_ricci.nodes():
-        curvs = [G_ricci[node][nb].get('ricciCurvature', 0) for nb in G_ricci.neighbors(node)]
-        node_ricci[node] = np.mean(curvs) if curvs else 0.0
-    
-    ricci = np.array([node_ricci[i] for i in range(n)])
-    print(f"Ricci: min={ricci.min():.4f}, max={ricci.max():.4f}, mean={ricci.mean():.4f}")
-    
-    # Важность
-    deg = np.array([G.degree(i) for i in range(n)])
-    dc = deg / (n-1)
-    importance = np.abs(ricci) * (dc * 5 + 1)
-    importance = (importance - importance.min()) / (importance.max() - importance.min() + 1e-10)
-    
-    # Pruning
-    print("\nPruning experiments...")
-    sorted_idx = np.argsort(importance)
-    
-    def map_layer(labels):
-        m = {}
-        for idx, label in enumerate(labels):
+        for idx in prune_indices:
+            label = neuron_labels[idx]
             layer, neuron = label.split(':')
-            m[idx] = (layer, int(neuron))
-        return m
+            neuron = int(neuron)
+            
+            if layer == 'conv1':
+                pruned.conv1.weight[neuron] = 0.0
+                pruned.conv1.bias[neuron] = 0.0
+            elif layer == 'conv2':
+                pruned.conv2.weight[neuron] = 0.0
+                pruned.conv2.bias[neuron] = 0.0
+            elif layer == 'fc1':
+                pruned.fc1.weight[neuron] = 0.0
+                pruned.fc1.bias[neuron] = 0.0
     
-    neuron_map = map_layer(neuron_labels)
-    fractions = [0.1, 0.2, 0.3, 0.4, 0.5]
-    results = []
+    return pruned
+
+
+def main(
+    epochs: int,
+    prune_fractions: List[float],
+    output_name: str
+) -> None:
+    """Оркестрация полного пайплайна анализа топологии MNIST CNN.
     
-    for frac in fractions:
+    Args:
+        epochs: Количество эпох для обучения (если модель не найдена).
+        prune_fractions: Список долей нейронов для pruning.
+        output_name: Имя для выходных файлов.
+    """
+    device = torch.device('cpu')
+    
+    logger.info("=" * 60)
+    logger.info("MNIST RICCI PIPELINE")
+    logger.info("Анализ топологии нейросети через кривизну Риччи")
+    logger.info("=" * 60)
+    
+    # 1. Загрузка/обучение модели
+    checkpoint_path = 'simple_cnn_mnist.pth'
+    model = load_or_train_model(checkpoint_path, epochs, device)
+    model.eval()
+    
+    # Данные для тестирования
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,))
+    ])
+    
+    test_dataset = datasets.MNIST('./data', train=False, download=True, transform=transform)
+    test_loader = DataLoader(test_dataset, batch_size=1000, shuffle=False)
+    
+    train_dataset = datasets.MNIST('./data', train=True, download=True, transform=transform)
+    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+    
+    baseline = accuracy(model, test_loader, device)
+    logger.info(f"Baseline accuracy: {baseline:.2f}%")
+    
+    # 2. Сбор активаций
+    logger.info("\nСбор активаций...")
+    activations = collect_activations(model, train_loader, device, max_batches=50)
+    
+    # 3. Построение графа
+    logger.info("Построение графа корреляций...")
+    G, corr_matrix, neuron_labels = build_activation_graph(activations, corr_threshold=0.7)
+    n = len(neuron_labels)
+    logger.info(f"Граф: {n} узлов, {G.number_of_edges()} рёбер")
+    
+    # 4. Вычисление кривизны
+    logger.info("Вычисление кривизны Оливье-Риччи...")
+    ricci = compute_ricci_curvature(G, alpha=0.5)
+    logger.info(f"Ricci: min={ricci.min():.4f}, max={ricci.max():.4f}, mean={ricci.mean():.4f}")
+    
+    # Классификация
+    mountains = np.where(ricci > 0.1)[0]
+    plateaus = np.where((ricci > -0.1) & (ricci < 0.1))[0]
+    singularities = np.where(ricci < -0.1)[0]
+    
+    logger.info(f"\nЛандшафт:")
+    logger.info(f" Горы (Ricci > 0.1): {len(mountains)}")
+    logger.info(f" Плато (-0.1..0.1): {len(plateaus)}")
+    logger.info(f" Сингулярности (< -0.1): {len(singularities)}")
+    
+    # Сортировка по важности
+    deg = np.array([G.degree(i) for i in range(n)])
+    importance = np.abs(ricci) * (deg / (n - 1) * 5 + 1)
+    importance = (importance - importance.min()) / (importance.max() - importance.min() + 1e-10)
+    sorted_by_importance = np.argsort(importance)
+    
+    # 5. Pruning эксперименты
+    logger.info("\n" + "=" * 60)
+    logger.info("PRUNING ЭКСПЕРИМЕНТЫ")
+    logger.info("=" * 60)
+    
+    results: List[float] = []
+    
+    for frac in prune_fractions:
         n_prune = int(n * frac)
-        prune_set = set(sorted_idx[:n_prune])
+        prune_set = set(sorted_by_importance[:n_prune])
         
-        masks = defaultdict(lambda: torch.ones(200))
-        for idx in prune_set:
-            layer, neuron = neuron_map[idx]
-            masks[layer][neuron] = 0.0
-        
-        pm = MNIST_CNN().to(device)
-        pm.load_state_dict(model.state_dict())
-        
-        with torch.no_grad():
-            if 'conv1' in masks:
-                m = masks['conv1'][:16].to(device)
-                pm.conv1.weight.data *= m.view(1,-1,1,1)
-                pm.conv1.bias.data *= m
-            if 'conv2' in masks:
-                m = masks['conv2'][:32].to(device)
-                pm.conv2.weight.data *= m.view(1,-1,1,1)
-                pm.conv2.bias.data *= m
-            if 'fc1' in masks:
-                m = masks['fc1'][:128].to(device)
-                pm.fc1.weight.data *= m.unsqueeze(1)
-                pm.fc1.bias.data *= m
-        
-        acc = accuracy(pm, test_loader)
+        pruned = prune_model(model, prune_set, neuron_labels, device)
+        acc = accuracy(pruned, test_loader, device)
         results.append(acc)
-        print(f"  Prune {frac:.0%}: {acc:.2f}% (drop {baseline-acc:.2f}%)")
-        del pm
+        
+        logger.info(f"Prune {frac:.0%}: {acc:.2f}% (Δ {acc - baseline:+.2f}%)")
+        del pruned
     
-    # Сохранение
-    print("\nSaving results...")
-    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
-    axes[0].plot([0] + fractions, [baseline] + results, 'bo-', lw=2, ms=8)
-    axes[0].axhline(y=baseline, color='r', linestyle='--', label='Baseline')
+    # 6. Визуализация
+    logger.info("\nПостроение графиков...")
+    
+    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
+    
+    # График 1: Pruning curve
+    axes[0].plot([0] + prune_fractions, [baseline] + results, 'bo-', linewidth=2, markersize=8)
+    axes[0].axhline(y=baseline, color='red', linestyle='--', alpha=0.5, label='Baseline')
     axes[0].set_xlabel('Prune Fraction')
     axes[0].set_ylabel('Accuracy (%)')
-    axes[0].set_title('Topology-based Pruning (Ollivier-Ricci)')
+    axes[0].set_title('Accuracy vs Prune Fraction')
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
     
-    axes[1].hist(ricci, bins=30, color='steelblue', edgecolor='white')
-    axes[1].axvline(x=0, color='red', linestyle='--')
+    # График 2: Ricci distribution
+    axes[1].hist(ricci, bins=40, color='steelblue', edgecolor='white', alpha=0.7)
+    axes[1].axvline(x=0, color='black', linestyle='-', linewidth=2)
+    axes[1].axvline(x=-0.1, color='red', linestyle='--', alpha=0.7, label='Singularities')
+    axes[1].axvline(x=0.1, color='gold', linestyle='--', alpha=0.7, label='Mountains')
     axes[1].set_xlabel('Ricci Curvature')
-    axes[1].set_title('Ricci Distribution')
+    axes[1].set_ylabel('Neurons')
+    axes[1].set_title('Ricci Curvature Distribution')
+    axes[1].legend()
     axes[1].grid(True, alpha=0.3)
     
+    # График 3: Importance
+    axes[2].plot(importance[sorted_by_importance], 'g-', linewidth=2)
+    axes[2].set_xlabel('Neuron Rank')
+    axes[2].set_ylabel('Importance')
+    axes[2].set_title('Neuron Importance')
+    axes[2].grid(True, alpha=0.3)
+    
     plt.tight_layout()
-    plt.savefig('ricci_results_linux.png', dpi=150)
-    print("Saved: ricci_results_linux.png")
+    plot_path = f'{output_name}.png'
+    plt.savefig(plot_path, dpi=150)
+    logger.info(f"Сохранено: {plot_path}")
     
-    np.savez('ricci_results_linux.npz', baseline=baseline, fractions=fractions,
-             results=results, ricci=ricci, importance=importance)
+    # 7. Сохранение данных
+    npz_path = f'{output_name}.npz'
+    np.savez(
+        npz_path,
+        baseline=baseline,
+        fractions=prune_fractions,
+        accuracies=results,
+        ricci=ricci,
+        mountains=mountains,
+        singularities=singularities,
+        plateaus=plateaus
+    )
+    logger.info(f"Данные сохранены: {npz_path}")
     
-    # Итоги
-    print("\n" + "=" * 50)
-    print("SUMMARY")
-    print("=" * 50)
-    print(f"Baseline: {baseline:.2f}%")
-    print(f"Ricci: [{ricci.min():.4f}, {ricci.max():.4f}]")
-    neg = np.sum(ricci < -1e-6)
-    zero = np.sum(np.abs(ricci) < 1e-6)
-    pos = np.sum(ricci > 1e-6)
-    print(f"Neg/Zero/Pos: {neg}/{zero}/{pos}")
-    
-    for frac, acc in zip(fractions, results):
-        loss = baseline - acc
-        s = "OK" if loss < 2 else "WARN" if loss < 5 else "FAIL"
-        print(f"  [{s}] {frac:.0%}: {acc:.2f}% (loss {loss:.2f}%)")
-    
-    print("\nDone! 🚀")
+    logger.info("\n" + "=" * 60)
+    logger.info("ГОТОВО!")
+    logger.info("=" * 60)
+
 
 if __name__ == '__main__':
+    import multiprocessing as mp
     mp.freeze_support()
-    main()
+    
+    parser = argparse.ArgumentParser(description='MNIST Ricci Pipeline')
+    parser.add_argument(
+        '--epochs',
+        type=int,
+        default=3,
+        help='Количество эпох для обучения (по умолчанию: 3)'
+    )
+    parser.add_argument(
+        '--prune-fractions',
+        type=float,
+        nargs='+',
+        default=[0.05, 0.10, 0.15, 0.20, 0.25, 0.30],
+        help='Доли нейронов для pruning (по умолчанию: 0.05 0.10 0.15 0.20 0.25 0.30)'
+    )
+    parser.add_argument(
+        '--output-name',
+        type=str,
+        default='mnist_ricci_results',
+        help='Имя для выходных файлов (по умолчанию: mnist_ricci_results)'
+    )
+    
+    args = parser.parse_args()
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    main(
+        epochs=args.epochs,
+        prune_fractions=args.prune_fractions,
+        output_name=args.output_name
+    )

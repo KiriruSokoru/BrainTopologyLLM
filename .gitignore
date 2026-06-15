@@ -41,3 +41,22 @@ config/
 *.pyc
 __pycache__/
 checkpoints/*.pt
+
+# BrainTopologyLLM artifacts
+checkpoints/
+results/
+data/
+models/
+logs/
+*.pth
+*.pt
+*.npz
+*.png
+*.csv
+*.json
+!pyproject.toml
+!requirements.txt
+
+# Experiments artifacts
+experiments/fundamentals/*.png
+experiments/fundamentals/*.csv

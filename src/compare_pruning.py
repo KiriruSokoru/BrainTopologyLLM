@@ -1,415 +1,290 @@
 #!/usr/bin/env python3
 """
-Compare Pruning Methods: Ricci vs Random vs Weight Magnitude
-=============================================================
-Три стратегии pruning на одном графе активаций.
-Доказывает превосходство топологического подхода.
+Сравнение методов pruning: Ricci, Weight (Magnitude), Random.
+
+Оценивает деградацию точности при удалении нейронов разными стратегиями.
 """
 
-import multiprocessing as mp
-import torch
-import torch.nn as nn
-from torchvision import datasets, transforms
-from torch.utils.data import DataLoader
-import numpy as np
-import networkx as nx
-from GraphRicciCurvature.OllivierRicci import OllivierRicci
+import argparse
+import logging
+import os
+from typing import Dict, List, Set, Tuple
+
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
-from collections import defaultdict
-import os, warnings, copy
-warnings.filterwarnings('ignore')
+import numpy as np
+import torch
+from torch.utils.data import DataLoader
+from torchvision import datasets, transforms
+
+from src.core.models import MNIST_CNN
+from src.core.metrics import accuracy
+from src.core.activations import collect_activations
+from src.core.graph_builder import build_activation_graph, parse_neuron_labels
+from src.core.ricci import compute_ricci_curvature
+
+logger = logging.getLogger(__name__)
 
 torch.set_num_threads(4)
-os.environ['OMP_NUM_THREADS'] = '4'
 
-# ==============================================================================
-# МОДЕЛЬ
-# ==============================================================================
 
-class MNIST_CNN(nn.Module):
-    def __init__(self):
-        super().__init__()
-        self.conv1 = nn.Conv2d(1, 16, 3, padding=1)
-        self.conv2 = nn.Conv2d(16, 32, 3, padding=1)
-        self.fc1 = nn.Linear(32*7*7, 128)
-        self.fc2 = nn.Linear(128, 10)
-        self.relu = nn.ReLU()
-        self.pool = nn.MaxPool2d(2,2)
-        self.activations = {}
-        self._hooks()
-    
-    def _hooks(self):
-        def hook(name):
-            def fn(m, i, o): self.activations[name] = o.detach()
-            return fn
-        self.conv1.register_forward_hook(hook('conv1'))
-        self.conv2.register_forward_hook(hook('conv2'))
-        self.fc1.register_forward_hook(hook('fc1'))
-        self.fc2.register_forward_hook(hook('fc2'))
-    
-    def forward(self, x):
-        x = self.pool(self.relu(self.conv1(x)))
-        x = self.pool(self.relu(self.conv2(x)))
-        x = x.view(x.size(0), -1)
-        x = self.relu(self.fc1(x))
-        x = self.fc2(x)
-        return x
+def get_neuron_weights(model: MNIST_CNN, neuron_map: Dict[int, Tuple[str, int]]) -> np.ndarray:
+    """Вычисляет важность нейронов на основе L2-нормы их весов (Magnitude-based).
 
-# ==============================================================================
-# УТИЛИТЫ
-# ==============================================================================
+    Args:
+        model: Обученная модель PyTorch.
+        neuron_map: Словарь маппинга {глобальный_индекс: (имя_слоя, локальный_индекс)}.
 
-def accuracy(m, loader, dev):
-    m.eval()
-    correct = 0
-    with torch.no_grad():
-        for data, target in loader:
-            data, target = data.to(dev), target.to(dev)
-            output = m(data)
-            pred = output.argmax(dim=1, keepdim=True)
-            correct += pred.eq(target.view_as(pred)).sum().item()
-    return 100. * correct / len(loader.dataset)
-
-def get_neuron_weights(model):
-    """Извлекаем magnitude важность нейронов."""
-    weights = []
-    # conv1: 16 каналов
-    w = model.conv1.weight.data.abs().sum(dim=[1,2,3]).cpu().numpy()
-    weights.extend(w)
-    # conv2: 32 канала
-    w = model.conv2.weight.data.abs().sum(dim=[1,2,3]).cpu().numpy()
-    weights.extend(w)
-    # fc1: 128 нейронов
-    w = model.fc1.weight.data.abs().sum(dim=1).cpu().numpy()
-    weights.extend(w)
-    # fc2: 10 выходов (не трогаем)
-    w = model.fc2.weight.data.abs().sum(dim=1).cpu().numpy()
-    weights.extend(w)
-    return np.array(weights)
-
-def prune_model(model, prune_indices, neuron_map, dev):
-    """Создаёт прuned копию модели."""
-    layer_masks = defaultdict(lambda: torch.ones(200))
-    for idx in prune_indices:
-        layer, neuron = neuron_map[idx]
-        layer_masks[layer][neuron] = 0.0
-    
-    pm = MNIST_CNN().to(dev)
-    pm.load_state_dict(model.state_dict())
+    Returns:
+        Массив важности (L2-норма) для каждого нейрона.
+    """
+    n_neurons = len(neuron_map)
+    weights_norm = np.zeros(n_neurons)
     
     with torch.no_grad():
-        if 'conv1' in layer_masks:
-            m = layer_masks['conv1'][:16].to(dev)
-            pm.conv1.weight.data *= m.view(-1, 1, 1, 1)  # [16,1,1,1]
-            pm.conv1.bias.data *= m
-        
-        if 'conv2' in layer_masks:
-            m = layer_masks['conv2'][:32].to(dev)
-            pm.conv2.weight.data *= m.view(-1, 1, 1, 1)  # [32,1,1,1]
-            pm.conv2.bias.data *= m
-        
-        if 'fc1' in layer_masks:
-            m = layer_masks['fc1'][:128].to(dev)
-            pm.fc1.weight.data *= m.unsqueeze(1)  # [128,1]
-            pm.fc1.bias.data *= m
-    return pm
+        for idx, (layer_name, local_idx) in neuron_map.items():
+            if layer_name == 'conv1':
+                w = model.conv1.weight[local_idx]
+            elif layer_name == 'conv2':
+                w = model.conv2.weight[local_idx]
+            elif layer_name == 'fc1':
+                w = model.fc1.weight[local_idx]
+            else:
+                continue
+            
+            # L2-норма весов нейрона как мера его важности
+            weights_norm[idx] = torch.norm(w).item()
+            
+    return weights_norm
 
-# ==============================================================================
-# MAIN
-# ==============================================================================
 
-def main():
-    dev = torch.device('cpu')
-    print("=" * 60)
-    print("PRUNING METHODS COMPARISON")
-    print("Ricci Topology vs Random vs Weight Magnitude")
-    print("=" * 60)
+def prune_model(
+    model: MNIST_CNN, 
+    prune_indices: Set[int], 
+    neuron_map: Dict[int, Tuple[str, int]], 
+    device: torch.device
+) -> MNIST_CNN:
+    """Применяет маску pruning (зануление) к указанным нейронам.
+
+    Args:
+        model: Исходная модель.
+        prune_indices: Множество глобальных индексов нейронов для удаления.
+        neuron_map: Словарь маппинга индексов.
+        device: Устройство вычислений.
+
+    Returns:
+        Новая модель с применённым pruning.
+    """
+    pruned = MNIST_CNN().to(device)
+    pruned.load_state_dict(model.state_dict())
     
-    # Данные
+    with torch.no_grad():
+        for idx in prune_indices:
+            layer_name, local_idx = neuron_map[idx]
+            
+            if layer_name == 'conv1':
+                pruned.conv1.weight[local_idx] = 0.0
+                pruned.conv1.bias[local_idx] = 0.0
+            elif layer_name == 'conv2':
+                pruned.conv2.weight[local_idx] = 0.0
+                pruned.conv2.bias[local_idx] = 0.0
+            elif layer_name == 'fc1':
+                pruned.fc1.weight[local_idx] = 0.0
+                pruned.fc1.bias[local_idx] = 0.0
+                
+    return pruned
+
+
+def main(
+    methods: List[str],
+    fractions: List[float],
+    checkpoint_path: str,
+    output_dir: str
+) -> None:
+    """Оркестрация эксперимента по сравнению методов pruning.
+
+    Args:
+        methods: Список методов для сравнения ('Ricci', 'Weight', 'Random').
+        fractions: Список долей нейронов для удаления.
+        checkpoint_path: Путь к предобученной модели.
+        output_dir: Директория для сохранения результатов.
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    device = torch.device('cpu')
+    
+    logger.info("=" * 60)
+    logger.info("СРАВНЕНИЕ МЕТОДОВ PRUNING")
+    logger.info(f"Методы: {', '.join(methods)}")
+    logger.info(f"Доли: {fractions}")
+    logger.info("=" * 60)
+
+    # 1. Данные
     transform = transforms.Compose([
         transforms.ToTensor(),
         transforms.Normalize((0.1307,), (0.3081,))
     ])
     test_dataset = datasets.MNIST('./data', train=False, download=True, transform=transform)
     test_loader = DataLoader(test_dataset, batch_size=1000, shuffle=False)
+    
     train_dataset = datasets.MNIST('./data', train=True, download=True, transform=transform)
     train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-    
-    # Загружаем или обучаем модель
-    model = MNIST_CNN().to(dev)
-    if os.path.exists('simple_cnn_mnist.pth'):
-        model.load_state_dict(torch.load('simple_cnn_mnist.pth', map_location=dev))
-        print("Model loaded from file")
-    else:
-        print("Training...")
-        import torch.optim as optim
-        opt = optim.Adam(model.parameters(), lr=0.001)
-        crit = nn.CrossEntropyLoss()
-        for epoch in range(3):
-            model.train()
-            for data, target in train_loader:
-                data, target = data.to(dev), target.to(dev)
-                opt.zero_grad()
-                crit(model(data), target).backward()
-                opt.step()
-        torch.save(model.state_dict(), 'simple_cnn_mnist.pth')
-    
+
+    # 2. Модель
+    if not os.path.exists(checkpoint_path):
+        logger.error(f"Чекпоинт не найден: {checkpoint_path}. Сначала запустите mnist_ricci_pipeline.py")
+        return
+        
+    model = MNIST_CNN().to(device)
+    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
     model.eval()
-    baseline = accuracy(model, test_loader, dev)
-    print(f"Baseline accuracy: {baseline:.2f}%\n")
     
-    # ==========================================================================
-    # 1. Собираем активации и строим граф
-    # ==========================================================================
+    baseline = accuracy(model, test_loader, device)
+    logger.info(f"Baseline accuracy: {baseline:.2f}%")
+
+    # 3. Сбор данных для анализа топологии
+    logger.info("Сбор активаций и построение графа...")
+    activations = collect_activations(model, train_loader, device, max_batches=50)
+    G, _, neuron_labels = build_activation_graph(activations, corr_threshold=0.7)
+    n = len(neuron_labels)
+    neuron_map = parse_neuron_labels(neuron_labels)
     
-    print("Collecting activations (50 batches)...")
-    all_acts = defaultdict(list)
-    with torch.no_grad():
-        for idx, (data, _) in enumerate(train_loader):
-            if idx >= 50: break
-            data = data.to(dev)
-            _ = model(data)
-            for name, act in model.activations.items():
-                if len(act.shape) == 4:
-                    act = act.mean(dim=[2,3])
-                all_acts[name].append(act.cpu().numpy())
+    logger.info("Вычисление кривизны Риччи...")
+    ricci = compute_ricci_curvature(G, alpha=0.5)
     
-    for name in all_acts:
-        all_acts[name] = np.concatenate(all_acts[name], axis=0)
+    # 4. Расчёт важности для каждого метода
+    logger.info("Расчёт метрик важности нейронов...")
+    importance_scores: Dict[str, np.ndarray] = {}
     
-    neuron_data = []
-    neuron_labels = []
-    for layer_name, acts in all_acts.items():
-        for i in range(acts.shape[1]):
-            neuron_data.append(acts[:, i])
-            neuron_labels.append(f"{layer_name}:{i}")
-    
-    neuron_data = np.array(neuron_data)
-    corr = np.corrcoef(neuron_data)
-    n_neurons = corr.shape[0]
-    
-    print(f"Building graph ({n_neurons} neurons)...")
-    G = nx.Graph()
-    G.add_nodes_from(range(n_neurons))
-    for i in range(n_neurons):
-        for j in range(i+1, n_neurons):
-            if abs(corr[i,j]) >= 0.7:
-                G.add_edge(i, j, weight=1.0 - abs(corr[i,j]))
-    
-    print(f"Graph: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges")
-    
-    def map_layer(labels):
-        m = {}
-        for idx, label in enumerate(labels):
-            layer, neuron = label.split(':')
-            m[idx] = (layer, int(neuron))
-        return m
-    neuron_map = map_layer(neuron_labels)
-    
-    # ==========================================================================
-    # 2. ВЫЧИСЛЯЕМ ВАЖНОСТЬ ТРЕМЯ МЕТОДАМИ
-    # ==========================================================================
-    
-    print("\n" + "=" * 60)
-    print("COMPUTING IMPORTANCE SCORES")
-    print("=" * 60)
-    
-    # --- Метод 1: Ricci Topology ---
-    print("\n[1/3] Ollivier-Ricci curvature...")
-    orc = OllivierRicci(G, alpha=0.5, weight="weight", verbose="INFO")
-    G_ricci = orc.compute_ricci_curvature()
-    
-    node_ricci = {}
-    for node in G_ricci.nodes():
-        curvs = [G_ricci[node][nb].get('ricciCurvature', 0) for nb in G_ricci.neighbors(node)]
-        node_ricci[node] = np.mean(curvs) if curvs else 0.0
-    
-    ricci = np.array([node_ricci[i] for i in range(n_neurons)])
-    deg = np.array([G.degree(i) for i in range(n_neurons)])
-    dc = deg / (n_neurons - 1)
-    
-    importance_ricci = np.abs(ricci) * (dc * 5 + 1)
-    importance_ricci = (importance_ricci - importance_ricci.min()) / \
-                       (importance_ricci.max() - importance_ricci.min() + 1e-10)
-    
-    # Сортируем: от МЕНЕЕ важных к БОЛЕЕ важным
-    sorted_ricci = np.argsort(importance_ricci)
-    
-    print(f"  Ricci range: [{ricci.min():.3f}, {ricci.max():.3f}]")
-    print(f"  Importance range: [{importance_ricci.min():.3f}, {importance_ricci.max():.3f}]")
-    
-    # --- Метод 2: Weight Magnitude ---
-    print("\n[2/3] Weight magnitude...")
-    importance_weight = get_neuron_weights(model)
-    importance_weight = (importance_weight - importance_weight.min()) / \
-                        (importance_weight.max() - importance_weight.min() + 1e-10)
-    sorted_weight = np.argsort(importance_weight)  # менее важные -> более важные
-    
-    print(f"  Weight range: [{importance_weight.min():.3f}, {importance_weight.max():.3f}]")
-    
-    # --- Метод 3: Random ---
-    print("\n[3/3] Random baseline...")
-    sorted_random = np.random.permutation(n_neurons)
-    print(f"  Random seed: 42 (first 5: {sorted_random[:5]})")
-    
-    # ==========================================================================
-    # 3. PRUNING EXPERIMENT
-    # ==========================================================================
-    
-    print("\n" + "=" * 60)
-    print("PRUNING EXPERIMENTS")
-    print("=" * 60)
-    
-    fractions = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50]
-    
-    results = {
-        'Ricci': [],
-        'Weight': [],
-        'Random': []
-    }
+    if 'Ricci' in methods:
+        # Для Ricci важность = модуль кривизны (чем ближе к 0 или отрицательная, тем менее важен/более сингулярен)
+        # Но для pruning мы удаляем наименее важные. В нашем контексте "мастера" (высокий Ricci) важны.
+        # Поэтому сортируем по возрастанию Ricci (удаляем сначала сингулярности/плато).
+        importance_scores['Ricci'] = ricci 
+        
+    if 'Weight' in methods:
+        importance_scores['Weight'] = get_neuron_weights(model, neuron_map)
+        
+    if 'Random' in methods:
+        importance_scores['Random'] = np.random.rand(n)
+
+    # Сортировка индексов по возрастанию важности (чтобы удалять наименее важные первыми)
+    sorted_indices: Dict[str, np.ndarray] = {}
+    for method in methods:
+        sorted_indices[method] = np.argsort(importance_scores[method])
+
+    # 5. Эксперимент по pruning
+    logger.info("\nЗапуск экспериментов по pruning...")
+    results: Dict[str, List[float]] = {method: [] for method in methods}
     
     for frac in fractions:
-        n_prune = int(n_neurons * frac)
-        print(f"\n--- Prune {frac:.0%} ({n_prune}/{n_neurons} neurons) ---")
+        n_prune = int(n * frac)
+        logger.info(f"--- Prune {frac:.0%} ({n_prune}/{n} нейронов) ---")
         
-        for method, sorted_idx in [('Ricci', sorted_ricci), 
-                                    ('Weight', sorted_weight), 
-                                    ('Random', sorted_random)]:
-            prune_set = set(sorted_idx[:n_prune])
-            pm = prune_model(model, prune_set, neuron_map, dev)
-            acc = accuracy(pm, test_loader, dev)
+        for method in methods:
+            prune_set = set(sorted_indices[method][:n_prune])
+            pruned_model = prune_model(model, prune_set, neuron_map, device)
+            acc = accuracy(pruned_model, test_loader, device)
             results[method].append(acc)
-            print(f"  {method:8s}: {acc:.2f}% (Δ {acc-baseline:+.2f}%)")
-            del pm
+            logger.info(f"  {method:6s}: {acc:.2f}% (Δ {acc - baseline:+.2f}%)")
+            del pruned_model
+
+    # 6. Визуализация
+    logger.info("\nПостроение графиков...")
+    plt.figure(figsize=(10, 6))
     
-    # ==========================================================================
-    # 4. ВИЗУАЛИЗАЦИЯ
-    # ==========================================================================
-    
-    print("\n" + "=" * 60)
-    print("GENERATING PLOTS")
-    print("=" * 60)
-    
-    fig, axes = plt.subplots(1, 3, figsize=(18, 5))
-    
-    colors = {'Ricci': '#2196F3', 'Weight': '#FF9800', 'Random': '#9E9E9E'}
+    colors = {'Ricci': 'green', 'Weight': 'blue', 'Random': 'red'}
     markers = {'Ricci': 'o', 'Weight': 's', 'Random': '^'}
     
-    # График 1: Accuracy vs Prune Fraction
-    ax = axes[0]
-    for method in ['Ricci', 'Weight', 'Random']:
-        ax.plot([0] + fractions, [baseline] + results[method],
-                color=colors[method], marker=markers[method],
-                linewidth=2, markersize=7, label=method)
-    ax.axhline(y=baseline, color='black', linestyle='--', alpha=0.5, label='Baseline')
-    ax.axhline(y=90, color='green', linestyle=':', alpha=0.5, label='90% threshold')
-    ax.set_xlabel('Prune Fraction', fontsize=12)
-    ax.set_ylabel('Accuracy (%)', fontsize=12)
-    ax.set_title('Pruning Methods Comparison', fontsize=13, fontweight='bold')
-    ax.legend(fontsize=10)
-    ax.grid(True, alpha=0.3)
-    ax.set_ylim(0, 100)
+    for method in methods:
+        plt.plot(
+            [0.0] + fractions, 
+            [baseline] + results[method], 
+            color=colors.get(method, 'gray'), 
+            marker=markers.get(method, 'o'),
+            linewidth=2, 
+            markersize=8, 
+            label=f"{method} Pruning"
+        )
+        
+    plt.axhline(y=baseline, color='black', linestyle='--', alpha=0.5, label='Baseline')
+    plt.xlabel('Prune Fraction')
+    plt.ylabel('Accuracy (%)')
+    plt.title('Сравнение методов pruning на MNIST CNN')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.xlim(-0.02, max(fractions) + 0.02)
     
-    # График 2: Accuracy Drop
-    ax = axes[1]
-    for method in ['Ricci', 'Weight', 'Random']:
-        drops = [baseline - acc for acc in results[method]]
-        ax.plot(fractions, drops,
-                color=colors[method], marker=markers[method],
-                linewidth=2, markersize=7, label=method)
-    ax.axhline(y=0, color='black', linestyle='--', alpha=0.5)
-    ax.axhline(y=2, color='orange', linestyle=':', alpha=0.5, label='2% tolerance')
-    ax.set_xlabel('Prune Fraction', fontsize=12)
-    ax.set_ylabel('Accuracy Drop (%)', fontsize=12)
-    ax.set_title('Accuracy Degradation', fontsize=13, fontweight='bold')
-    ax.legend(fontsize=10)
-    ax.grid(True, alpha=0.3)
-    
-    # График 3: Распределение важности
-    ax = axes[2]
-    ax.hist(importance_ricci, bins=30, alpha=0.6, color=colors['Ricci'], label='Ricci', edgecolor='white')
-    ax.hist(importance_weight, bins=30, alpha=0.6, color=colors['Weight'], label='Weight', edgecolor='white')
-    ax.set_xlabel('Normalized Importance', fontsize=12)
-    ax.set_ylabel('Number of Neurons', fontsize=12)
-    ax.set_title('Importance Distribution', fontsize=13, fontweight='bold')
-    ax.legend(fontsize=10)
-    ax.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.savefig('pruning_comparison.png', dpi=150, bbox_inches='tight')
-    print("Saved: pruning_comparison.png")
-    
-    # ==========================================================================
-    # 5. СОХРАНЕНИЕ ДАННЫХ
-    # ==========================================================================
-    
-    np.savez('pruning_comparison.npz',
-             baseline=baseline,
-             fractions=fractions,
-             results_ricci=results['Ricci'],
-             results_weight=results['Weight'],
-             results_random=results['Random'],
-             importance_ricci=importance_ricci,
-             importance_weight=importance_weight,
-             ricci_values=ricci,
-             neuron_labels=neuron_labels)
-    print("Saved: pruning_comparison.npz")
-    
-    # ==========================================================================
-    # 6. АНАЛИЗ
-    # ==========================================================================
-    
-    print("\n" + "=" * 60)
-    print("ANALYSIS")
-    print("=" * 60)
-    
-    # Находим максимальный prune fraction с accuracy drop < 2%
-    print(f"\nPrune fractions with < 2% accuracy drop:")
-    for method in ['Ricci', 'Weight', 'Random']:
-        max_frac = 0
-        for frac, acc in zip(fractions, results[method]):
-            if baseline - acc < 2.0:
-                max_frac = frac
-        print(f"  {method:8s}: up to {max_frac:.0%}")
-    
-    # Находим, где Ricci превосходит другие методы
-    print(f"\nRicci advantage over Random:")
-    for frac, r_acc, rand_acc in zip(fractions, results['Ricci'], results['Random']):
-        advantage = r_acc - rand_acc
-        bar = '█' * int(advantage) if advantage > 0 else ''
-        print(f"  {frac:.0%}: Ricci {r_acc:.2f}% vs Random {rand_acc:.2f}% = {advantage:+.2f}% {bar}")
-    
-    print(f"\nRicci advantage over Weight Magnitude:")
-    for frac, r_acc, w_acc in zip(fractions, results['Ricci'], results['Weight']):
-        advantage = r_acc - w_acc
-        bar = '█' * int(abs(advantage)) if advantage > 0 else ''
-        print(f"  {frac:.0%}: Ricci {r_acc:.2f}% vs Weight {w_acc:.2f}% = {advantage:+.2f}% {bar}")
-    
-    # Ключевые инсайты
-    print("\n" + "=" * 60)
-    print("KEY INSIGHTS")
-    print("=" * 60)
-    
-    # При 20% pruning
-    idx_20 = fractions.index(0.20)
-    ricci_20 = results['Ricci'][idx_20]
-    weight_20 = results['Weight'][idx_20]
-    random_20 = results['Random'][idx_20]
-    
-    print(f"\nAt 20% pruning:")
-    print(f"  Ricci:   {ricci_20:.2f}% (Δ {ricci_20-baseline:+.2f}%)")
-    print(f"  Weight:  {weight_20:.2f}% (Δ {weight_20-baseline:+.2f}%)")
-    print(f"  Random:  {random_20:.2f}% (Δ {random_20-baseline:+.2f}%)")
-    print(f"  Ricci beats Random by {ricci_20-random_20:.2f}%")
-    print(f"  Ricci beats Weight by {ricci_20-weight_20:.2f}%")
-    
-    print("\n" + "=" * 60)
-    print("Experiment complete! 🚀")
-    print("Files: pruning_comparison.png, pruning_comparison.npz")
-    print("=" * 60)
+    plot_path = os.path.join(output_dir, 'pruning_comparison.png')
+    plt.savefig(plot_path, dpi=150)
+    plt.close()
+    logger.info(f"График сохранён: {plot_path}")
+
+    # 7. Сохранение данных
+    npz_path = os.path.join(output_dir, 'pruning_comparison.npz')
+    np.savez(
+        npz_path,
+        baseline=baseline,
+        fractions=fractions,
+        methods=methods,
+        **{f"results_{m}": results[m] for m in methods},
+        ricci=ricci,
+        neuron_labels=neuron_labels
+    )
+    logger.info(f"Данные сохранены: {npz_path}")
+    logger.info("=" * 60)
+    logger.info("ЭКСПЕРИМЕНТ ЗАВЕРШЁН УСПЕШНО")
+    logger.info("=" * 60)
+
 
 if __name__ == '__main__':
+    import multiprocessing as mp
     mp.freeze_support()
-    main()
+    
+    parser = argparse.ArgumentParser(description='Сравнение методов pruning (Ricci, Weight, Random)')
+    parser.add_argument(
+        '--methods',
+        nargs='+',
+        choices=['Ricci', 'Weight', 'Random', 'all'],
+        default=['all'],
+        help='Методы для сравнения (по умолчанию: all)'
+    )
+    parser.add_argument(
+        '--fractions',
+        type=float,
+        nargs='+',
+        default=[0.1, 0.2, 0.3, 0.4, 0.5],
+        help='Доли нейронов для удаления (по умолчанию: 0.1 0.2 0.3 0.4 0.5)'
+    )
+    parser.add_argument(
+        '--checkpoint',
+        type=str,
+        default='simple_cnn_mnist.pth',
+        help='Путь к предобученному чекпоинту модели (по умолчанию: simple_cnn_mnist.pth)'
+    )
+    parser.add_argument(
+        '--output-dir',
+        type=str,
+        default='results',
+        help='Директория для сохранения графиков и данных (по умолчанию: results)'
+    )
+    
+    args = parser.parse_args()
+    
+    # Обработка 'all'
+    if 'all' in args.methods:
+        methods_to_run = ['Ricci', 'Weight', 'Random']
+    else:
+        methods_to_run = args.methods
+        
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    main(
+        methods=methods_to_run,
+        fractions=args.fractions,
+        checkpoint_path=args.checkpoint,
+        output_dir=args.output_dir
+    )

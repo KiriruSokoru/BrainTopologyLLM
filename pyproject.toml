@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "brain-topology-llm"
+version = "0.1.0"
+description = "Топологическая оптимизация нейросетей через кривизну Риччи"
+authors = [
+    {name = "Kirill Sokol"}
+]
+license = {text = "MIT"}
+requires-python = ">=3.9"
+dependencies = [
+    "torch",
+    "torchvision",
+    "numpy",
+    "networkx",
+    "matplotlib",
+    "scikit-learn",
+    "tqdm",
+    "transformers",
+    "GraphRicciCurvature",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "pytest-cov",
+    "mypy",
+    "black",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v --tb=short"
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]

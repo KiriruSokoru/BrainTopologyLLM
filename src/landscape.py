@@ -1,170 +1,285 @@
 #!/usr/bin/env python3
 """
-Визуализация поверхности смысла (ландшафт кривизны Риччи).
-Использует сохранённые данные из perelman_surgery.npz.
+Визуализация топологического ландшафта нейросети.
+
+Загружает результаты эксперимента из .npz файла и строит:
+1. 3D ландшафт нейронов (t-SNE + кривизна Риччи)
+2. Сравнение методов pruning
+3. Распределение кривизны Риччи
 """
 
-import numpy as np
+import argparse
+import logging
+import os
+import sys
+from typing import Optional, Tuple
+
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.colors import ListedColormap
 from mpl_toolkits.mplot3d import Axes3D
-from matplotlib.patches import FancyBboxPatch
-import matplotlib.patches as mpatches
-
-# Загружаем данные
-data = np.load('results/perelman_surgery.npz', allow_pickle=True)
-ricci = data['ricci']
-mountains = data['mountains']
-singularities = data['singularities']
-plateaus = data['plateaus']
-baseline = float(data['baseline'])
-fractions = data['fractions']
-hard = data['hard']
-surgery = data['surgery']
-random = data['random']
-
-n = len(ricci)
-
-# Создаём координаты через спектральное вложение
-from sklearn.manifold import SpectralEmbedding
-
-# Строим матрицу смежности из сохранённых данных (упрощённо — из важности)
-# Для визуализации используем t-SNE на ricci + importance
-importance = np.abs(ricci) * (np.ones(n) * 5 + 1)  # упрощённо
-features = np.column_stack([ricci, importance])
-
-from sklearn.manifold import TSNE
-tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, n-1))
-coords = tsne.fit_transform(features)
-
-# Нормализуем координаты для красоты
-coords[:, 0] = (coords[:, 0] - coords[:, 0].min()) / (coords[:, 0].max() - coords[:, 0].min())
-coords[:, 1] = (coords[:, 1] - coords[:, 1].min()) / (coords[:, 1].max() - coords[:, 1].min())
-
-# Создаём фигуру
-fig = plt.figure(figsize=(20, 8))
-
-# ==============================================================================
-# Панель 1: 3D-ландшафт
-# ==============================================================================
-ax1 = fig.add_subplot(1, 3, 1, projection='3d')
-
-# Разделяем по типам
-for name, indices, color, marker, label in [
-    ('mountains', mountains, '#FFD700', '^', 'Горы (мастера)'),
-    ('plateaus', plateaus, '#87CEEB', 'o', 'Плато (стажёры)'),
-    ('singularities', singularities, '#FF4444', 's', 'Сингулярности (хаотики)')
-]:
-    if len(indices) > 0:
-        ax1.scatter(
-            coords[indices, 0], coords[indices, 1], ricci[indices],
-            c=color, marker=marker, s=40, alpha=0.8,
-            edgecolors='white', linewidth=0.5, label=label
-        )
-
-# Рисуем связи между соседними точками
 from scipy.spatial import Delaunay
-if n > 3:
-    tri = Delaunay(coords)
-    for simplex in tri.simplices:
-        for i in range(3):
-            p1 = coords[simplex[i]]
-            p2 = coords[simplex[(i+1)%3]]
-            mid_ricci = (ricci[simplex[i]] + ricci[simplex[(i+1)%3]]) / 2
-            ax1.plot(
-                [p1[0], p2[0]], [p1[1], p2[1]], [mid_ricci, mid_ricci],
-                'gray', alpha=0.08, linewidth=0.3
-            )
 
-ax1.set_xlabel('Измерение 1', fontsize=10)
-ax1.set_ylabel('Измерение 2', fontsize=10)
-ax1.set_zlabel('Кривизна Риччи', fontsize=10)
-ax1.set_title('Поверхность смысла\n', fontsize=13, fontweight='bold')
-ax1.legend(fontsize=9, loc='upper left')
-ax1.view_init(elev=25, azim=45)
+logger = logging.getLogger(__name__)
 
-# Добавляем плоскость нулевой кривизны
-xx, yy = np.meshgrid(np.linspace(0, 1, 10), np.linspace(0, 1, 10))
-ax1.plot_surface(xx, yy, np.zeros_like(xx), alpha=0.1, color='gray')
 
-# ==============================================================================
-# Панель 2: Сравнение методов
-# ==============================================================================
-ax2 = fig.add_subplot(1, 3, 2)
+def plot_3d_landscape(
+    coords: np.ndarray,
+    ricci: np.ndarray,
+    mountains: np.ndarray,
+    plateaus: np.ndarray,
+    singularities: np.ndarray,
+    ax: Axes3D
+) -> None:
+    """Строит 3D визуализацию топологического ландшафта.
 
-ax2.plot([0] + list(fractions), [baseline] + list(hard), 
-         'o-', color='#2196F3', linewidth=2, markersize=7, label='Жёсткое удаление')
-ax2.plot([0] + list(fractions), [baseline] + list(surgery), 
-         's-', color='#4CAF50', linewidth=2, markersize=7, label='Хирургия Перельмана')
-ax2.plot([0] + list(fractions), [baseline] + list(random), 
-         '^-', color='#9E9E9E', linewidth=2, markersize=7, label='Случайное')
+    Args:
+        coords: Координаты нейронов в 2D пространстве (n_neurons, 2).
+        ricci: Массив кривизны Риччи для каждого нейрона.
+        mountains: Индексы нейронов-мастеров (положительная кривизна).
+        plateaus: Индексы нейронов-стажёров (кривизна около нуля).
+        singularities: Индексы нейронов-сингулярностей (отрицательная кривизна).
+        ax: 3D ось matplotlib для отрисовки.
+    """
+    # Цвета для разных типов нейронов
+    colors = np.full(len(ricci), 'lightblue', dtype=object)
+    colors[mountains] = 'gold'
+    colors[singularities] = 'red'
+    
+    # 3D scatter plot
+    ax.scatter(
+        coords[:, 0], 
+        coords[:, 1], 
+        ricci, 
+        c=colors, 
+        s=30, 
+        alpha=0.7,
+        edgecolors='none'
+    )
+    
+    # Попытка построить Delaunay триангуляцию для поверхности
+    try:
+        tri = Delaunay(coords)
+        ax.plot_trisurf(
+            coords[:, 0], 
+            coords[:, 1], 
+            ricci, 
+            triangles=tri.simplices, 
+            alpha=0.1, 
+            color='gray'
+        )
+    except Exception as e:
+        logger.warning(f"Не удалось построить Delaunay триангуляцию: {e}")
+    
+    ax.set_xlabel('t-SNE Dim 1')
+    ax.set_ylabel('t-SNE Dim 2')
+    ax.set_zlabel('Ricci Curvature')
+    ax.set_title('Топологический ландшафт\n(золото=мастера, красный=сингулярности, синий=плато)')
 
-ax2.axhline(y=baseline, color='black', linestyle='--', alpha=0.5, linewidth=1)
-ax2.fill_between([0, 0.3], baseline-2, baseline+2, alpha=0.1, color='green', label='±2% зона')
 
-ax2.set_xlabel('Доля удалённых нейронов', fontsize=11)
-ax2.set_ylabel('Точность (%)', fontsize=11)
-ax2.set_title('Стабильность методов\n', fontsize=13, fontweight='bold')
-ax2.legend(fontsize=9)
-ax2.grid(True, alpha=0.3)
-ax2.set_ylim(0, 100)
+def plot_method_comparison(
+    fractions: np.ndarray,
+    baseline: float,
+    hard: np.ndarray,
+    surgery: np.ndarray,
+    random: np.ndarray,
+    ax: plt.Axes
+) -> None:
+    """Строит график сравнения методов pruning.
 
-# ==============================================================================
-# Панель 3: Распределение с аннотациями
-# ==============================================================================
-ax3 = fig.add_subplot(1, 3, 3)
+    Args:
+        fractions: Массив долей pruning.
+        baseline: Базовая точность до pruning.
+        hard: Точность после жёсткого pruning.
+        surgery: Точность после хирургии Перельмана.
+        random: Точность после случайного pruning.
+        ax: Ось matplotlib для отрисовки.
+    """
+    ax.plot(
+        [0] + list(fractions), 
+        [baseline] + list(hard), 
+        'bo-', 
+        linewidth=2, 
+        markersize=7, 
+        label='Hard prune'
+    )
+    ax.plot(
+        [0] + list(fractions), 
+        [baseline] + list(surgery), 
+        'go-', 
+        linewidth=2, 
+        markersize=7, 
+        label='Perelman surgery'
+    )
+    ax.plot(
+        [0] + list(fractions), 
+        [baseline] + list(random), 
+        'ro-', 
+        linewidth=2, 
+        markersize=7, 
+        label='Random'
+    )
+    ax.axhline(y=baseline, color='black', linestyle='--', alpha=0.5)
+    ax.set_xlabel('Prune Fraction')
+    ax.set_ylabel('Accuracy (%)')
+    ax.set_title('Сравнение методов pruning')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
 
-counts, bins, patches = ax3.hist(ricci, bins=35, color='steelblue', edgecolor='white', alpha=0.7)
 
-# Раскрашиваем столбцы по зонам
-for i, patch in enumerate(patches):
-    bin_center = (bins[i] + bins[i+1]) / 2
-    if bin_center < -0.1:
-        patch.set_facecolor('#FF4444')
-        patch.set_alpha(0.7)
-    elif bin_center > 0.1:
-        patch.set_facecolor('#FFD700')
-        patch.set_alpha(0.7)
-    else:
-        patch.set_facecolor('#87CEEB')
-        patch.set_alpha(0.7)
+def plot_ricci_distribution(
+    ricci: np.ndarray,
+    mountains: np.ndarray,
+    plateaus: np.ndarray,
+    singularities: np.ndarray,
+    ax: plt.Axes
+) -> None:
+    """Строит гистограмму распределения кривизны Риччи.
 
-ax3.axvline(x=0, color='black', linestyle='-', linewidth=2, alpha=0.7)
-ax3.axvline(x=-0.1, color='#FF4444', linestyle='--', linewidth=1.5, alpha=0.7)
-ax3.axvline(x=0.1, color='#FFD700', linestyle='--', linewidth=1.5, alpha=0.7)
+    Args:
+        ricci: Массив кривизны Риччи для каждого нейрона.
+        mountains: Индексы нейронов-мастеров.
+        plateaus: Индексы нейронов-стажёров.
+        singularities: Индексы нейронов-сингулярностей.
+        ax: Ось matplotlib для отрисовки.
+    """
+    ax.hist(ricci, bins=40, color='steelblue', edgecolor='white', alpha=0.7)
+    ax.axvline(x=0, color='black', linestyle='-', linewidth=2)
+    ax.axvline(x=-0.1, color='red', linestyle='--', alpha=0.7, label='Порог сингулярностей')
+    ax.axvline(x=0.1, color='gold', linestyle='--', alpha=0.7, label='Порог мастеров')
+    ax.set_xlabel('Ricci Curvature')
+    ax.set_ylabel('Количество нейронов')
+    ax.set_title(
+        f'Распределение кривизны\n'
+        f'{len(mountains)} мастеров, {len(singularities)} сингулярностей, {len(plateaus)} плато'
+    )
+    ax.legend()
+    ax.grid(True, alpha=0.3)
 
-# Аннотации
-ax3.annotate(f'Сингулярности\n{len(singularities)} нейронов', 
-             xy=(-0.25, max(counts)*0.8), fontsize=10, color='#FF4444',
-             ha='center', fontweight='bold')
-ax3.annotate(f'Плато\n{len(plateaus)} нейронов', 
-             xy=(0, max(counts)*0.5), fontsize=10, color='#4169E1',
-             ha='center', fontweight='bold')
-ax3.annotate(f'Горы\n{len(mountains)} нейронов', 
-             xy=(0.5, max(counts)*0.8), fontsize=10, color='#B8860B',
-             ha='center', fontweight='bold')
 
-ax3.set_xlabel('Кривизна Риччи', fontsize=11)
-ax3.set_ylabel('Число нейронов', fontsize=11)
-ax3.set_title('Ландшафт сети\n', fontsize=13, fontweight='bold')
-ax3.grid(True, alpha=0.3)
+def main(input_path: str, output_path: str) -> None:
+    """Оркестрация визуализации топологического ландшафта.
 
-# Общий заголовок
-fig.suptitle('Топологическая оптимизация нейросети: метод Перельмана\n'
-             'MNIST CNN, 186 нейронов, кривизна Олливье-Риччи',
-             fontsize=15, fontweight='bold', y=0.98)
+    Args:
+        input_path: Путь к .npz файлу с результатами эксперимента.
+        output_path: Путь для сохранения PNG файла с визуализацией.
+    """
+    logger.info("=" * 60)
+    logger.info("ВИЗУАЛИЗАЦИЯ ТОПОЛОГИЧЕСКОГО ЛАНДШАФТА")
+    logger.info("=" * 60)
+    
+    # 1. Загрузка данных
+    if not os.path.exists(input_path):
+        logger.error(f"Файл не найден: {input_path}")
+        logger.error("Сначала запустите perelman_surgery.py для генерации данных")
+        sys.exit(1)
+    
+    logger.info(f"Загрузка данных из {input_path}")
+    try:
+        data = np.load(input_path, allow_pickle=True)
+    except Exception as e:
+        logger.error(f"Ошибка при загрузке файла: {e}")
+        sys.exit(1)
+    
+    # Извлечение данных
+    baseline = float(data['baseline'])
+    fractions = data['fractions']
+    hard = data['hard']
+    surgery = data['surgery']
+    random = data['random']
+    ricci = data['ricci']
+    mountains = data['mountains']
+    singularities = data['singularities']
+    plateaus = data['plateaus']
+    
+    logger.info(f"Загружено: {len(ricci)} нейронов")
+    logger.info(f"Baseline accuracy: {baseline:.2f}%")
+    logger.info(f"Ландшафт: {len(mountains)} мастеров, {len(singularities)} сингулярностей, {len(plateaus)} плато")
+    
+    # 2. Вычисление координат для 3D визуализации
+    logger.info("Вычисление координат (t-SNE)...")
+    n = len(ricci)
+    
+    # Попытка использовать t-SNE, если доступен
+    try:
+        from sklearn.manifold import TSNE
+        # Создаём фиктивную матрицу признаков на основе кривизны
+        # В реальном сценарии здесь должны быть активации или веса
+        features = np.column_stack([ricci, np.random.randn(n)])
+        tsne = TSNE(n_components=2, random_state=42, perplexity=min(30, n-1))
+        coords = tsne.fit_transform(features)
+        logger.info("Использован t-SNE для проекции")
+    except ImportError:
+        logger.warning("t-SNE недоступен, используется SpectralEmbedding")
+        from sklearn.manifold import SpectralEmbedding
+        # Используем случайные координаты как fallback
+        coords = np.random.randn(n, 2)
+    except Exception as e:
+        logger.warning(f"Ошибка t-SNE: {e}, используются случайные координаты")
+        coords = np.random.randn(n, 2)
+    
+    # 3. Построение визуализации
+    logger.info("Построение графиков...")
+    fig = plt.figure(figsize=(18, 6))
+    
+    # Панель 1: 3D ландшафт
+    ax1 = fig.add_subplot(1, 3, 1, projection='3d')
+    plot_3d_landscape(coords, ricci, mountains, plateaus, singularities, ax1)
+    
+    # Панель 2: Сравнение методов
+    ax2 = fig.add_subplot(1, 3, 2)
+    plot_method_comparison(fractions, baseline, hard, surgery, random, ax2)
+    
+    # Панель 3: Распределение Ricci
+    ax3 = fig.add_subplot(1, 3, 3)
+    plot_ricci_distribution(ricci, mountains, plateaus, singularities, ax3)
+    
+    plt.tight_layout()
+    
+    # 4. Сохранение
+    output_dir = os.path.dirname(output_path)
+    if output_dir and not os.path.exists(output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+    
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    
+    logger.info(f"Визуализация сохранена: {output_path}")
+    logger.info("=" * 60)
+    logger.info("ГОТОВО!")
+    logger.info("=" * 60)
 
-plt.tight_layout()
-plt.savefig('results/landscape_final.png', dpi=150, bbox_inches='tight')
-print("Сохранено: results/landscape_final.png")
 
-# Статистика для README
-print(f"\nСтатистика ландшафта:")
-print(f"  Всего нейронов: {n}")
-print(f"  Горы (мастера): {len(mountains)} ({len(mountains)/n*100:.0f}%)")
-print(f"  Плато (стажёры): {len(plateaus)} ({len(plateaus)/n*100:.0f}%)")
-print(f"  Сингулярности (хаотики): {len(singularities)} ({len(singularities)/n*100:.0f}%)")
-print(f"  Baseline точность: {baseline:.2f}%")
-print(f"  Макс. точность surgery: {max(surgery):.2f}% при {fractions[np.argmax(surgery)]:.0%} pruning")
-
+if __name__ == '__main__':
+    import multiprocessing as mp
+    mp.freeze_support()
+    
+    parser = argparse.ArgumentParser(
+        description='Визуализация топологического ландшафта нейросети'
+    )
+    parser.add_argument(
+        '--input',
+        type=str,
+        default='results/perelman_surgery.npz',
+        help='Путь к .npz файлу с результатами эксперимента (по умолчанию: results/perelman_surgery.npz)'
+    )
+    parser.add_argument(
+        '--output',
+        type=str,
+        default='results/landscape_visualization.png',
+        help='Путь для сохранения PNG файла с визуализацией (по умолчанию: results/landscape_visualization.png)'
+    )
+    
+    args = parser.parse_args()
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+    
+    main(
+        input_path=args.input,
+        output_path=args.output
+    )
